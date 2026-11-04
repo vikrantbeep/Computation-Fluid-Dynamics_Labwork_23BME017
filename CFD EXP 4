@@ -1,0 +1,979 @@
+
+# ================================================================
+# EXPERIMENT 4: KARMAN VORTEX STREET OVER A CYLINDER
+# D2Q9 BGK LATTICE BOLTZMANN METHOD
+# COMPLETE SELF-CONTAINED GOOGLE COLAB CODE
+# ================================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+import csv
+import math
+import os
+import zipfile
+from pathlib import Path
+
+from google.colab import files
+from IPython.display import display, Markdown
+
+# ================================================================
+# 1. SIMULATION PARAMETERS
+# ================================================================
+
+RUN_MODE = "lab"
+
+# LAB CONFIGURATION
+NX = 181
+NY = 81
+RE = 100.0
+OUTER_STEPS = 1200
+NUMERICAL_ITERATIONS = 45
+OUTPUT_EVERY = 300
+
+# Quick mode is available for testing only
+if RUN_MODE == "quick":
+    NX, NY = 31, 17
+    OUTER_STEPS = 8
+    NUMERICAL_ITERATIONS = 5
+    OUTPUT_EVERY = 8
+
+# ================================================================
+# 2. INITIALIZATION
+# ================================================================
+
+OUTPUT_DIR = Path("/content/cfd_lab_exp04")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+INLET_SPEED = 0.10
+
+SUBSTEPS = max(
+    1,
+    min(4, int(round(NUMERICAL_ITERATIONS / 10.0)))
+)
+
+DIAMETER = max(4, int(round(NY / 8.0)))
+RADIUS = 0.5 * DIAMETER
+
+CENTER_X = int(round(0.25 * NX))
+CENTER_Y = 0.5 * (NY - 1)
+
+NU = INLET_SPEED * DIAMETER / RE
+TAU = 0.5 + 3.0 * NU
+
+if TAU <= 0.505:
+    raise ValueError("Relaxation time too close to 0.5.")
+
+OMEGA = 1.0 / TAU
+
+print("=" * 60)
+print("KARMAN VORTEX STREET SIMULATION")
+print("=" * 60)
+
+print(f"Grid size             : {NX} x {NY}")
+print(f"Reynolds number       : {RE}")
+print(f"Cylinder diameter     : {DIAMETER}")
+print(f"Inlet velocity        : {INLET_SPEED}")
+print(f"Kinematic viscosity   : {NU}")
+print(f"Relaxation time       : {TAU}")
+print(f"LBM substeps          : {SUBSTEPS}")
+print(f"Outer iterations      : {OUTER_STEPS}")
+
+# ================================================================
+# 3. D2Q9 LATTICE DEFINITIONS
+# ================================================================
+
+VELOCITIES = np.array([
+    [0, 0],
+    [1, 0],
+    [0, 1],
+    [-1, 0],
+    [0, -1],
+    [1, 1],
+    [-1, 1],
+    [-1, -1],
+    [1, -1]
+], dtype=int)
+
+WEIGHTS = np.array([
+    4/9,
+    1/9,
+    1/9,
+    1/9,
+    1/9,
+    1/36,
+    1/36,
+    1/36,
+    1/36
+])
+
+OPPOSITE = np.array([
+    0, 3, 4, 1, 2, 7, 8, 5, 6
+])
+
+# ================================================================
+# 4. EQUILIBRIUM DISTRIBUTION FUNCTION
+# ================================================================
+
+def equilibrium(rho, ux, uy):
+
+    result = np.empty((9, NY, NX))
+
+    speed_squared = ux**2 + uy**2
+
+    for q, (cx, cy) in enumerate(VELOCITIES):
+
+        cu = cx * ux + cy * uy
+
+        result[q] = (
+            WEIGHTS[q] * rho *
+            (
+                1
+                + 3 * cu
+                + 4.5 * cu**2
+                - 1.5 * speed_squared
+            )
+        )
+
+    return result
+
+
+# ================================================================
+# 5. CYLINDER GEOMETRY
+# ================================================================
+
+J, I = np.mgrid[0:NY, 0:NX]
+
+SOLID = (
+    (I - CENTER_X)**2 +
+    (J - CENTER_Y)**2
+) <= RADIUS**2
+
+FLUID = ~SOLID
+
+plt.figure(figsize=(9, 3))
+
+plt.imshow(
+    SOLID,
+    origin="lower",
+    cmap="gray"
+)
+
+plt.title("Computational Domain and Cylinder")
+plt.xlabel("X")
+plt.ylabel("Y")
+plt.tight_layout()
+plt.show()
+
+# ================================================================
+# 6. INITIAL FLOW CONDITIONS
+# ================================================================
+
+RHO = np.ones((NY, NX))
+
+UX = np.full(
+    (NY, NX),
+    INLET_SPEED
+)
+
+UY = (
+    0.05 * INLET_SPEED
+    * np.sin(2 * math.pi * J / NY)
+    * np.exp(
+        -((I - CENTER_X) / (2 * DIAMETER))**2
+    )
+)
+
+UX[SOLID] = 0
+UY[SOLID] = 0
+
+F = equilibrium(RHO, UX, UY)
+
+F[:, SOLID] = 0
+
+# Inlet boundary condition
+
+INLET_RHO = np.ones((NY, 1))
+
+INLET_UX = np.full(
+    (NY, 1),
+    INLET_SPEED
+)
+
+INLET_UY = np.zeros((NY, 1))
+
+INLET_F = equilibrium(
+    INLET_RHO,
+    INLET_UX,
+    INLET_UY
+)[:, :, 0]
+
+# ================================================================
+# 7. STORAGE FOR RESULTS
+# ================================================================
+
+HISTORY = []
+
+LATTICE_TIME = 0
+
+# ================================================================
+# 8. MAIN LATTICE BOLTZMANN SOLVER
+# ================================================================
+
+print("\nStarting simulation...\n")
+
+for STEP in range(1, OUTER_STEPS + 1):
+
+    FORCE_X = 0.0
+    FORCE_Y = 0.0
+
+    for SUBSTEP in range(SUBSTEPS):
+
+        # --------------------------------------------------------
+        # Macroscopic density and velocity
+        # --------------------------------------------------------
+
+        RHO = np.sum(F, axis=0)
+
+        SAFE_RHO = np.where(
+            RHO > 1e-30,
+            RHO,
+            1.0
+        )
+
+        UX = (
+            np.tensordot(
+                VELOCITIES[:, 0],
+                F,
+                axes=(0, 0)
+            ) / SAFE_RHO
+        )
+
+        UY = (
+            np.tensordot(
+                VELOCITIES[:, 1],
+                F,
+                axes=(0, 0)
+            ) / SAFE_RHO
+        )
+
+        UX[SOLID] = 0
+        UY[SOLID] = 0
+
+        # --------------------------------------------------------
+        # Collision step: BGK model
+        # --------------------------------------------------------
+
+        FEQ = equilibrium(
+            SAFE_RHO,
+            UX,
+            UY
+        )
+
+        F_POST = F - OMEGA * (F - FEQ)
+
+        F_POST[:, SOLID] = 0
+
+        # --------------------------------------------------------
+        # Streaming and bounce-back
+        # --------------------------------------------------------
+
+        F_STREAM = np.zeros_like(F)
+
+        for Q, (CX, CY) in enumerate(VELOCITIES):
+
+            DESTINATION_SOLID = (
+                FLUID &
+                np.roll(
+                    SOLID,
+                    shift=(-CY, -CX),
+                    axis=(0, 1)
+                )
+            )
+
+            SOURCE = F_POST[Q]
+
+            # Momentum exchange force
+
+            FORCE_X += (
+                2.0
+                * np.sum(SOURCE[DESTINATION_SOLID])
+                * CX
+            )
+
+            FORCE_Y += (
+                2.0
+                * np.sum(SOURCE[DESTINATION_SOLID])
+                * CY
+            )
+
+            # Streaming
+
+            F_STREAM[Q] += np.roll(
+                SOURCE * (~DESTINATION_SOLID),
+                shift=(CY, CX),
+                axis=(0, 1)
+            )
+
+            # Bounce-back
+
+            F_STREAM[OPPOSITE[Q]][DESTINATION_SOLID] += (
+                SOURCE[DESTINATION_SOLID]
+            )
+
+        F = F_STREAM
+
+        # --------------------------------------------------------
+        # Boundary conditions
+        # --------------------------------------------------------
+
+        F[:, :, 0] = INLET_F
+
+        F[:, :, -1] = F[:, :, -2]
+
+        F[:, SOLID] = 0
+
+        LATTICE_TIME += 1
+
+    # ============================================================
+    # 9. CALCULATE DRAG AND LIFT COEFFICIENTS
+    # ============================================================
+
+    RHO = np.sum(F, axis=0)
+
+    SAFE_RHO = np.where(
+        RHO > 1e-30,
+        RHO,
+        1.0
+    )
+
+    UX = (
+        np.tensordot(
+            VELOCITIES[:, 0],
+            F,
+            axes=(0, 0)
+        ) / SAFE_RHO
+    )
+
+    UY = (
+        np.tensordot(
+            VELOCITIES[:, 1],
+            F,
+            axes=(0, 0)
+        ) / SAFE_RHO
+    )
+
+    UX[SOLID] = 0
+    UY[SOLID] = 0
+
+    DENOMINATOR = (
+        0.5
+        * INLET_SPEED**2
+        * DIAMETER
+        * SUBSTEPS
+    )
+
+    CD = FORCE_X / DENOMINATOR
+
+    CL = FORCE_Y / DENOMINATOR
+
+    MAX_SPEED = np.max(
+        np.sqrt(UX**2 + UY**2)
+    )
+
+    DENSITY_DEVIATION = np.max(
+        np.abs(RHO[FLUID] - 1.0)
+    )
+
+    DIMENSIONLESS_TIME = (
+        LATTICE_TIME
+        * INLET_SPEED
+        / DIAMETER
+    )
+
+    HISTORY.append([
+        STEP,
+        LATTICE_TIME,
+        DIMENSIONLESS_TIME,
+        CD,
+        CL,
+        MAX_SPEED,
+        np.min(RHO[FLUID]),
+        np.max(RHO[FLUID]),
+        DENSITY_DEVIATION
+    ])
+
+    # Numerical stability checks
+
+    if not (
+        np.all(np.isfinite(RHO[FLUID]))
+        and np.all(np.isfinite(UX[FLUID]))
+        and np.all(np.isfinite(UY[FLUID]))
+    ):
+        raise FloatingPointError(
+            f"Non-finite values at step {STEP}"
+        )
+
+    if MAX_SPEED > 0.45 or DENSITY_DEVIATION > 0.25:
+
+        raise FloatingPointError(
+            f"Nonphysical solution at step {STEP}"
+        )
+
+    # ------------------------------------------------------------
+    # Progress output
+    # ------------------------------------------------------------
+
+    if (
+        STEP == 1
+        or STEP == OUTER_STEPS
+        or STEP % max(1, OUTER_STEPS // 8) == 0
+    ):
+
+        print(
+            f"Step {STEP:5d}/{OUTER_STEPS} | "
+            f"Cd = {CD:10.5f} | "
+            f"Cl = {CL:10.5f} | "
+            f"Max velocity = {MAX_SPEED:.5f}"
+        )
+
+    # ------------------------------------------------------------
+    # Save intermediate VTK fields
+    # ------------------------------------------------------------
+
+    if (
+        STEP % OUTPUT_EVERY == 0
+        or STEP == OUTER_STEPS
+    ):
+
+        PHYSICAL_X = I / DIAMETER
+
+        PHYSICAL_Y = (
+            J - CENTER_Y
+        ) / DIAMETER
+
+        PRESSURE = np.where(
+            FLUID,
+            (RHO - 1.0) / 3.0,
+            0.0
+        )
+
+        VORTICITY = np.zeros_like(UX)
+
+        VORTICITY[1:-1, 1:-1] = (
+            (UY[1:-1, 2:] - UY[1:-1, :-2]) / 2.0
+            -
+            (UX[2:, 1:-1] - UX[:-2, 1:-1]) / 2.0
+        )
+
+        VORTICITY *= DIAMETER / INLET_SPEED
+
+        # Save VTK structured grid
+
+        VTK_FILE = (
+            OUTPUT_DIR /
+            f"cylinder_vortex_{STEP:06d}.vtk"
+        )
+
+        def write_vtk(path):
+
+            with open(path, "w") as HANDLE:
+
+                HANDLE.write("# vtk DataFile Version 3.0\n")
+                HANDLE.write("D2Q9 Cylinder Vortex Shedding\n")
+                HANDLE.write("ASCII\n")
+                HANDLE.write("DATASET STRUCTURED_GRID\n")
+
+                HANDLE.write(
+                    f"DIMENSIONS {NX} {NY} 1\n"
+                )
+
+                HANDLE.write(
+                    f"POINTS {NX * NY} float\n"
+                )
+
+                for Y in range(NY):
+
+                    for X in range(NX):
+
+                        HANDLE.write(
+                            f"{PHYSICAL_X[Y,X]:.8e} "
+                            f"{PHYSICAL_Y[Y,X]:.8e} 0\n"
+                        )
+
+                HANDLE.write(
+                    f"POINT_DATA {NX * NY}\n"
+                )
+
+                SCALARS = {
+                    "pressure_lbm": PRESSURE,
+                    "density": np.where(FLUID, RHO, 1.0),
+                    "vorticity_nondimensional": VORTICITY,
+                    "solid_mask": SOLID.astype(float),
+                    "speed_lattice": np.sqrt(UX**2 + UY**2)
+                }
+
+                for NAME, FIELD in SCALARS.items():
+
+                    HANDLE.write(
+                        f"SCALARS {NAME} float 1\n"
+                    )
+
+                    HANDLE.write(
+                        "LOOKUP_TABLE default\n"
+                    )
+
+                    for VALUE in FIELD.ravel():
+
+                        HANDLE.write(
+                            f"{VALUE:.8e}\n"
+                        )
+
+                HANDLE.write(
+                    "VECTORS velocity_lattice float\n"
+                )
+
+                for VX, VY in zip(
+                    UX.ravel(),
+                    UY.ravel()
+                ):
+
+                    HANDLE.write(
+                        f"{VX:.8e} {VY:.8e} 0\n"
+                    )
+
+        write_vtk(VTK_FILE)
+
+# ================================================================
+# 10. FINAL FLOW FIELD
+# ================================================================
+
+PHYSICAL_X = I / DIAMETER
+
+PHYSICAL_Y = (
+    J - CENTER_Y
+) / DIAMETER
+
+PRESSURE = np.where(
+    FLUID,
+    (RHO - 1.0) / 3.0,
+    0.0
+)
+
+VORTICITY = np.zeros_like(UX)
+
+VORTICITY[1:-1, 1:-1] = (
+    (UY[1:-1, 2:] - UY[1:-1, :-2]) / 2.0
+    -
+    (UX[2:, 1:-1] - UX[:-2, 1:-1]) / 2.0
+)
+
+VORTICITY *= DIAMETER / INLET_SPEED
+
+FINAL_VTK = OUTPUT_DIR / "cylinder_vortex_final.vtk"
+
+# Write final field
+
+def save_final_vtk():
+
+    with open(FINAL_VTK, "w") as HANDLE:
+
+        HANDLE.write("# vtk DataFile Version 3.0\n")
+        HANDLE.write("Final Cylinder Vortex Field\n")
+        HANDLE.write("ASCII\n")
+        HANDLE.write("DATASET STRUCTURED_GRID\n")
+
+        HANDLE.write(
+            f"DIMENSIONS {NX} {NY} 1\n"
+        )
+
+        HANDLE.write(
+            f"POINTS {NX * NY} float\n"
+        )
+
+        for Y in range(NY):
+
+            for X in range(NX):
+
+                HANDLE.write(
+                    f"{PHYSICAL_X[Y,X]:.8e} "
+                    f"{PHYSICAL_Y[Y,X]:.8e} 0\n"
+                )
+
+        HANDLE.write(
+            f"POINT_DATA {NX * NY}\n"
+        )
+
+        FIELDS = {
+            "pressure_lbm": PRESSURE,
+            "density": np.where(FLUID, RHO, 1.0),
+            "vorticity_nondimensional": VORTICITY,
+            "solid_mask": SOLID.astype(float),
+            "speed_lattice": np.sqrt(UX**2 + UY**2)
+        }
+
+        for NAME, FIELD in FIELDS.items():
+
+            HANDLE.write(
+                f"SCALARS {NAME} float 1\n"
+            )
+
+            HANDLE.write(
+                "LOOKUP_TABLE default\n"
+            )
+
+            for VALUE in FIELD.ravel():
+
+                HANDLE.write(
+                    f"{VALUE:.8e}\n"
+                )
+
+        HANDLE.write(
+            "VECTORS velocity_lattice float\n"
+        )
+
+        for VX, VY in zip(
+            UX.ravel(),
+            UY.ravel()
+        ):
+
+            HANDLE.write(
+                f"{VX:.8e} {VY:.8e} 0\n"
+            )
+
+save_final_vtk()
+
+# ================================================================
+# 11. SAVE CYLINDER GEOMETRY
+# ================================================================
+
+THETA = np.linspace(
+    0,
+    2 * np.pi,
+    361
+)
+
+WALL_X = (
+    CENTER_X / DIAMETER
+    + 0.5 * np.cos(THETA)
+)
+
+WALL_Y = (
+    0.5 * np.sin(THETA)
+)
+
+WALL_FILE = OUTPUT_DIR / "cylinder_wall.csv"
+
+np.savetxt(
+    WALL_FILE,
+    np.column_stack([WALL_X, WALL_Y]),
+    delimiter=",",
+    header="x,y",
+    comments=""
+)
+
+# ================================================================
+# 12. SAVE NUMERICAL HISTORY
+# ================================================================
+
+HISTORY = np.array(HISTORY)
+
+CSV_FILE = OUTPUT_DIR / "cylinder_history.csv"
+
+HEADER = [
+    "outer_step",
+    "lattice_time",
+    "dimensionless_time_Ut_over_D",
+    "Cd_momentum_exchange",
+    "Cl_momentum_exchange",
+    "maximum_lattice_speed",
+    "minimum_density",
+    "maximum_density",
+    "maximum_density_deviation"
+]
+
+np.savetxt(
+    CSV_FILE,
+    HISTORY,
+    delimiter=",",
+    header=",".join(HEADER),
+    comments=""
+)
+
+# ================================================================
+# 13. STRouHAL NUMBER CALCULATION
+# ================================================================
+
+LIFT_HISTORY = HISTORY[:, 4]
+
+STROUHAL = 0.0
+
+if len(LIFT_HISTORY) >= 64:
+
+    START = len(LIFT_HISTORY) // 2
+
+    SIGNAL = (
+        LIFT_HISTORY[START:]
+        - np.mean(LIFT_HISTORY[START:])
+    )
+
+    if np.std(SIGNAL) >= 1e-5:
+
+        SPECTRUM = np.abs(
+            np.fft.rfft(
+                SIGNAL * np.hanning(len(SIGNAL))
+            )
+        )**2
+
+        FREQUENCY = np.fft.rfftfreq(
+            len(SIGNAL),
+            d=SUBSTEPS
+        )
+
+        ST_VALUES = (
+            FREQUENCY
+            * DIAMETER
+            / INLET_SPEED
+        )
+
+        VALID = (
+            (ST_VALUES >= 0.05)
+            & (ST_VALUES <= 0.35)
+        )
+
+        if np.any(VALID):
+
+            STROUHAL = ST_VALUES[VALID][
+                np.argmax(SPECTRUM[VALID])
+            ]
+
+# ================================================================
+# 14. SAVE SUMMARY
+# ================================================================
+
+SUMMARY_FILE = OUTPUT_DIR / "cylinder_summary.txt"
+
+with open(SUMMARY_FILE, "w") as HANDLE:
+
+    HANDLE.write(
+        "D2Q9 BGK Lattice Boltzmann Cylinder Vortex Shedding\n"
+    )
+
+    HANDLE.write(f"Grid X: {NX}\n")
+    HANDLE.write(f"Grid Y: {NY}\n")
+    HANDLE.write(f"Reynolds number: {RE}\n")
+    HANDLE.write(f"Outer steps: {OUTER_STEPS}\n")
+    HANDLE.write(f"Substeps: {SUBSTEPS}\n")
+    HANDLE.write(f"Lattice time: {LATTICE_TIME}\n")
+    HANDLE.write(f"Cylinder diameter: {DIAMETER}\n")
+    HANDLE.write(f"Inlet velocity: {INLET_SPEED}\n")
+    HANDLE.write(f"Kinematic viscosity: {NU}\n")
+    HANDLE.write(f"Relaxation time: {TAU}\n")
+
+    HANDLE.write(
+        f"Estimated Strouhal number: {STROUHAL:.8f}\n"
+    )
+
+    HANDLE.write(
+        "Reference Strouhal at Re=100: approximately 0.16-0.17\n"
+    )
+
+print("\nSimulation completed.")
+print(f"Estimated Strouhal number: {STROUHAL:.6f}")
+
+# ================================================================
+# 15. LIFT COEFFICIENT PLOT
+# ================================================================
+
+plt.figure(figsize=(9, 4.5))
+
+plt.plot(
+    HISTORY[:, 2],
+    HISTORY[:, 4],
+    linewidth=1.5
+)
+
+plt.xlabel("Dimensionless time (Ut/D)")
+plt.ylabel("Lift coefficient (Cl)")
+
+plt.title("Lift Coefficient vs Dimensionless Time")
+
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "lift_coefficient.png",
+    dpi=300
+)
+plt.show()
+
+# ================================================================
+# 16. DRAG COEFFICIENT PLOT
+# ================================================================
+
+plt.figure(figsize=(9, 4.5))
+
+plt.plot(
+    HISTORY[:, 2],
+    HISTORY[:, 3],
+    linewidth=1.5
+)
+
+plt.xlabel("Dimensionless time (Ut/D)")
+plt.ylabel("Drag coefficient (Cd)")
+
+plt.title("Drag Coefficient vs Dimensionless Time")
+
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "drag_coefficient.png",
+    dpi=300
+)
+plt.show()
+
+# ================================================================
+# 17. VORTICITY CONTOUR
+# ================================================================
+
+plt.figure(figsize=(12, 5))
+
+VORTICITY_PLOT = np.where(
+    FLUID,
+    VORTICITY,
+    np.nan
+)
+
+CONTOUR = plt.contourf(
+    PHYSICAL_X,
+    PHYSICAL_Y,
+    VORTICITY_PLOT,
+    levels=50,
+    cmap="RdBu_r"
+)
+
+plt.colorbar(
+    CONTOUR,
+    label="Non-dimensional vorticity"
+)
+
+plt.xlabel("x/D")
+plt.ylabel("y/D")
+
+plt.title(
+    "Karman Vortex Street - Vorticity Contour"
+)
+
+plt.axis("equal")
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "vorticity_contour.png",
+    dpi=300
+)
+
+plt.show()
+
+# ================================================================
+# 18. VELOCITY MAGNITUDE CONTOUR
+# ================================================================
+
+SPEED = np.sqrt(UX**2 + UY**2)
+
+plt.figure(figsize=(12, 5))
+
+SPEED_PLOT = np.where(
+    FLUID,
+    SPEED,
+    np.nan
+)
+
+CONTOUR = plt.contourf(
+    PHYSICAL_X,
+    PHYSICAL_Y,
+    SPEED_PLOT,
+    levels=50,
+    cmap="viridis"
+)
+
+plt.colorbar(
+    CONTOUR,
+    label="Velocity magnitude"
+)
+
+plt.xlabel("x/D")
+plt.ylabel("y/D")
+
+plt.title("Velocity Magnitude around Cylinder")
+
+plt.axis("equal")
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "velocity_contour.png",
+    dpi=300
+)
+
+plt.show()
+
+# ================================================================
+# 19. DISPLAY SUMMARY
+# ================================================================
+
+print("\n" + "=" * 60)
+print("FINAL SIMULATION SUMMARY")
+print("=" * 60)
+
+print(f"Reynolds number       : {RE}")
+print(f"Grid                  : {NX} x {NY}")
+print(f"Total lattice steps   : {LATTICE_TIME}")
+print(f"Final drag coefficient: {HISTORY[-1, 3]:.6f}")
+print(f"Final lift coefficient: {HISTORY[-1, 4]:.6f}")
+print(f"Strouhal number       : {STROUHAL:.6f}")
+
+print("=" * 60)
+
+with open(SUMMARY_FILE) as HANDLE:
+    print(HANDLE.read())
+
+# ================================================================
+# 20. ZIP ALL OUTPUT FILES
+# ================================================================
+
+ZIP_FILE = Path(
+    "/content/experiment_04_results.zip"
+)
+
+with zipfile.ZipFile(
+    ZIP_FILE,
+    "w",
+    zipfile.ZIP_DEFLATED
+) as ZIP:
+
+    for FILE in OUTPUT_DIR.iterdir():
+
+        if FILE.is_file():
+
+            ZIP.write(
+                FILE,
+                FILE.name
+            )
+
+print("\nAll output files packaged successfully.")
+
+print("\nFiles generated:")
+
+for FILE in sorted(OUTPUT_DIR.iterdir()):
+
+    print(
+        f"{FILE.name:40s} "
+        f"{FILE.stat().st_size / 1024:.2f} KB"
+    )
+
+# ================================================================
+# 21. DOWNLOAD RESULTS
+# ================================================================
+
+print("\nDownloading experiment results...")
+
+files.download(str(ZIP_FILE))
+
+print("\nEXPERIMENT 4 FINISHED.")
