@@ -1,0 +1,1251 @@
+
+# ================================================================
+# EXPERIMENT 7: SHALLOW WATER WAVE PROPAGATION
+# UPWIND METHOD VS LAX-WENDROFF METHOD
+# COMPLETE SELF-CONTAINED GOOGLE COLAB CODE
+# ================================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+import csv
+import math
+import zipfile
+
+from pathlib import Path
+from IPython.display import display, Markdown
+
+try:
+    from google.colab import files
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+
+# ================================================================
+# 1. SIMULATION PARAMETERS
+# ================================================================
+
+RUN_MODE = "lab"
+
+# LAB PARAMETERS
+NX = 401
+LENGTH = 20.0
+DEPTH = 1.0
+
+AMPLITUDE = 0.02
+SIGMA = 0.5
+CENTER = 10.0
+
+END_TIME = 2.0
+
+CFL = 0.8
+OUTPUT_EVERY = 25
+
+GRAVITY = 9.81
+
+VERTICAL_SCALE = 180.0
+NZ_VISUAL = 61
+
+if RUN_MODE == "quick":
+
+    NX = 81
+    END_TIME = 0.1
+    OUTPUT_EVERY = 10
+    NZ_VISUAL = 30
+
+elif RUN_MODE == "custom":
+
+    NX = 401
+    LENGTH = 20.0
+    DEPTH = 1.0
+    AMPLITUDE = 0.02
+    SIGMA = 0.5
+    CENTER = 10.0
+    END_TIME = 2.0
+    CFL = 0.8
+    OUTPUT_EVERY = 25
+    GRAVITY = 9.81
+    VERTICAL_SCALE = 180.0
+    NZ_VISUAL = 61
+
+OUTPUT_DIR = Path("/content/cfd_lab_exp07")
+
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+print("=" * 65)
+print("EXPERIMENT 7: SHALLOW WATER WAVE")
+print("=" * 65)
+
+print(f"Grid points             : {NX}")
+print(f"Domain length           : {LENGTH} m")
+print(f"Water depth             : {DEPTH} m")
+print(f"Initial amplitude       : {AMPLITUDE} m")
+print(f"Gaussian width          : {SIGMA} m")
+print(f"Initial wave centre     : {CENTER} m")
+print(f"Final simulation time   : {END_TIME} s")
+print(f"CFL number              : {CFL}")
+print(f"Gravity                 : {GRAVITY} m/s^2")
+
+
+# ================================================================
+# 2. INITIALIZE SPATIAL GRID
+# ================================================================
+
+if NX < 41:
+    raise ValueError("Use at least 41 grid points.")
+
+if LENGTH <= 0 or DEPTH <= 0 or GRAVITY <= 0:
+    raise ValueError("Length, depth and gravity must be positive.")
+
+if SIGMA <= 0 or END_TIME < 0:
+    raise ValueError("Invalid wave parameters.")
+
+if OUTPUT_EVERY < 1 or NZ_VISUAL < 3:
+    raise ValueError("Invalid output parameters.")
+
+CFL = min(0.99, max(0.01, CFL))
+
+X = np.linspace(
+    0.0,
+    LENGTH,
+    NX
+)
+
+DX = X[1] - X[0]
+
+# Shallow water wave speed
+
+WAVE_SPEED = math.sqrt(
+    GRAVITY * DEPTH
+)
+
+# Time step based on CFL condition
+
+DT_NOMINAL = (
+    CFL * DX / WAVE_SPEED
+)
+
+print(f"\nSpatial step DX         : {DX:.6e}")
+print(f"Wave speed              : {WAVE_SPEED:.6e} m/s")
+print(f"Nominal time step       : {DT_NOMINAL:.6e} s")
+
+
+# ================================================================
+# 3. INITIAL GAUSSIAN WAVE
+# ================================================================
+
+def gaussian(x, center, sigma):
+
+    return np.exp(
+        -0.5 * ((x - center) / sigma)**2
+    )
+
+
+ETA_INITIAL = (
+    AMPLITUDE
+    * gaussian(X, CENTER, SIGMA)
+)
+
+
+# ================================================================
+# 4. ANALYTICAL SOLUTION
+# ================================================================
+
+def analytical_eta(
+    x,
+    time,
+    speed,
+    amplitude,
+    center,
+    sigma
+):
+
+    right_wave = gaussian(
+        x,
+        center + speed * time,
+        sigma
+    )
+
+    left_wave = gaussian(
+        x,
+        center - speed * time,
+        sigma
+    )
+
+    return 0.5 * amplitude * (
+        right_wave + left_wave
+    )
+
+
+# ================================================================
+# 5. NUMERICAL METHODS
+# ================================================================
+
+def upwind(field, courant):
+
+    if courant >= 0.0:
+
+        return (
+            field
+            - courant * (
+                field - np.roll(field, 1)
+            )
+        )
+
+    else:
+
+        return (
+            field
+            - courant * (
+                np.roll(field, -1) - field
+            )
+        )
+
+
+def lax_wendroff(field, courant):
+
+    return (
+
+        field
+
+        - 0.5 * courant * (
+            np.roll(field, -1)
+            - np.roll(field, 1)
+        )
+
+        + 0.5 * courant**2 * (
+            np.roll(field, -1)
+            - 2.0 * field
+            + np.roll(field, 1)
+        )
+
+    )
+
+
+# ================================================================
+# 6. RECONSTRUCT FREE SURFACE AND VELOCITY
+# ================================================================
+
+def reconstruct(
+    wp,
+    wm,
+    depth,
+    speed
+):
+
+    velocity = 0.5 * (wp + wm)
+
+    eta = (
+        depth * (wp - wm)
+        / (2.0 * speed)
+    )
+
+    return eta, velocity
+
+
+# ================================================================
+# 7. ERROR AND MASS CALCULATIONS
+# ================================================================
+
+def relative_l2(
+    numerical,
+    reference
+):
+
+    numerator = np.linalg.norm(
+        numerical - reference
+    )
+
+    denominator = np.linalg.norm(
+        reference
+    )
+
+    return numerator / max(
+        denominator,
+        1e-30
+    )
+
+
+def trapezoidal_integral(
+    values,
+    coordinates
+):
+
+    return float(
+        np.trapezoid(
+            values,
+            coordinates
+        )
+    )
+
+
+# ================================================================
+# 8. INITIALIZE BOTH NUMERICAL SCHEMES
+# ================================================================
+
+# Characteristic variables:
+# W+ = u + c*eta/H
+# W- = u - c*eta/H
+
+WP_UPWIND = (
+    WAVE_SPEED * ETA_INITIAL / DEPTH
+)
+
+WM_UPWIND = (
+    -WAVE_SPEED * ETA_INITIAL / DEPTH
+)
+
+WP_LW = WP_UPWIND.copy()
+WM_LW = WM_UPWIND.copy()
+
+ETA_UPWIND, U_UPWIND = reconstruct(
+    WP_UPWIND,
+    WM_UPWIND,
+    DEPTH,
+    WAVE_SPEED
+)
+
+ETA_LW, U_LW = reconstruct(
+    WP_LW,
+    WM_LW,
+    DEPTH,
+    WAVE_SPEED
+)
+
+INITIAL_MASS = trapezoidal_integral(
+    ETA_INITIAL,
+    X
+)
+
+print(f"Initial wave mass        : {INITIAL_MASS:.8e}")
+
+
+# ================================================================
+# 9. INITIAL VISUALIZATION
+# ================================================================
+
+plt.figure(figsize=(10, 4))
+
+plt.plot(
+    X,
+    ETA_INITIAL,
+    linewidth=2
+)
+
+plt.xlabel("Position x (m)")
+plt.ylabel("Surface displacement (m)")
+
+plt.title(
+    "Initial Gaussian Surface Wave"
+)
+
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+# ================================================================
+# 10. MAIN TIME-STEPPING LOOP
+# ================================================================
+
+TIME = 0.0
+STEP = 0
+
+HISTORY = []
+
+SNAPSHOT_TIMES = [0.0]
+
+SNAPSHOT_ETA = [
+    ETA_LW.copy()
+]
+
+print("\nStarting numerical simulation...\n")
+
+while TIME < END_TIME - 1e-14:
+
+    DT = min(
+        DT_NOMINAL,
+        END_TIME - TIME
+    )
+
+    COURANT = (
+        WAVE_SPEED * DT / DX
+    )
+
+    # ------------------------------------------------------------
+    # UPWIND METHOD
+    # ------------------------------------------------------------
+
+    WP_UPWIND = upwind(
+        WP_UPWIND,
+        COURANT
+    )
+
+    WM_UPWIND = upwind(
+        WM_UPWIND,
+        -COURANT
+    )
+
+    # ------------------------------------------------------------
+    # LAX-WENDROFF METHOD
+    # ------------------------------------------------------------
+
+    WP_LW = lax_wendroff(
+        WP_LW,
+        COURANT
+    )
+
+    WM_LW = lax_wendroff(
+        WM_LW,
+        -COURANT
+    )
+
+    # Update time
+
+    TIME += DT
+    STEP += 1
+
+    # ------------------------------------------------------------
+    # RECONSTRUCT PHYSICAL VARIABLES
+    # ------------------------------------------------------------
+
+    ETA_UPWIND, U_UPWIND = reconstruct(
+        WP_UPWIND,
+        WM_UPWIND,
+        DEPTH,
+        WAVE_SPEED
+    )
+
+    ETA_LW, U_LW = reconstruct(
+        WP_LW,
+        WM_LW,
+        DEPTH,
+        WAVE_SPEED
+    )
+
+    # ------------------------------------------------------------
+    # ANALYTICAL REFERENCE
+    # ------------------------------------------------------------
+
+    ETA_REFERENCE = analytical_eta(
+        X,
+        TIME,
+        WAVE_SPEED,
+        AMPLITUDE,
+        CENTER,
+        SIGMA
+    )
+
+    # ------------------------------------------------------------
+    # ERROR CALCULATIONS
+    # ------------------------------------------------------------
+
+    ERROR_UPWIND = relative_l2(
+        ETA_UPWIND,
+        ETA_REFERENCE
+    )
+
+    ERROR_LW = relative_l2(
+        ETA_LW,
+        ETA_REFERENCE
+    )
+
+    # ------------------------------------------------------------
+    # MASS CONSERVATION
+    # ------------------------------------------------------------
+
+    MASS_UPWIND = trapezoidal_integral(
+        ETA_UPWIND,
+        X
+    )
+
+    MASS_LW = trapezoidal_integral(
+        ETA_LW,
+        X
+    )
+
+    # ------------------------------------------------------------
+    # SAVE HISTORY
+    # ------------------------------------------------------------
+
+    HISTORY.append([
+        STEP,
+        TIME,
+        DT,
+        COURANT,
+        ERROR_UPWIND,
+        ERROR_LW,
+        MASS_UPWIND,
+        MASS_LW
+    ])
+
+    # Numerical stability check
+
+    if not (
+        np.all(np.isfinite(ETA_UPWIND))
+        and np.all(np.isfinite(ETA_LW))
+    ):
+
+        raise FloatingPointError(
+            f"Non-finite solution at step {STEP}"
+        )
+
+    # ------------------------------------------------------------
+    # PROGRESS OUTPUT
+    # ------------------------------------------------------------
+
+    if (
+        STEP % max(1, OUTPUT_EVERY) == 0
+        or TIME >= END_TIME - 1e-14
+    ):
+
+        print(
+            f"Step {STEP:5d} | "
+            f"Time {TIME:.5f} | "
+            f"CFL {COURANT:.4f} | "
+            f"Upwind error {ERROR_UPWIND:.6e} | "
+            f"LW error {ERROR_LW:.6e}"
+        )
+
+        SNAPSHOT_TIMES.append(TIME)
+
+        SNAPSHOT_ETA.append(
+            ETA_LW.copy()
+        )
+
+
+# ================================================================
+# 11. FINAL ANALYTICAL SOLUTION
+# ================================================================
+
+ETA_REFERENCE = analytical_eta(
+    X,
+    TIME,
+    WAVE_SPEED,
+    AMPLITUDE,
+    CENTER,
+    SIGMA
+)
+
+FINAL_ERROR_UPWIND = relative_l2(
+    ETA_UPWIND,
+    ETA_REFERENCE
+)
+
+FINAL_ERROR_LW = relative_l2(
+    ETA_LW,
+    ETA_REFERENCE
+)
+
+FINAL_MASS_UPWIND = trapezoidal_integral(
+    ETA_UPWIND,
+    X
+)
+
+FINAL_MASS_LW = trapezoidal_integral(
+    ETA_LW,
+    X
+)
+
+print("\n" + "=" * 65)
+print("FINAL NUMERICAL RESULTS")
+print("=" * 65)
+
+print(
+    f"Total time steps          : {STEP}"
+)
+
+print(
+    f"Final time                : {TIME:.6f} s"
+)
+
+print(
+    f"Upwind relative L2 error  : {FINAL_ERROR_UPWIND:.8e}"
+)
+
+print(
+    f"Lax-Wendroff L2 error     : {FINAL_ERROR_LW:.8e}"
+)
+
+print(
+    f"Initial mass              : {INITIAL_MASS:.8e}"
+)
+
+print(
+    f"Upwind final mass         : {FINAL_MASS_UPWIND:.8e}"
+)
+
+print(
+    f"Lax-Wendroff final mass   : {FINAL_MASS_LW:.8e}"
+)
+
+
+# ================================================================
+# 12. VTK STRUCTURED GRID WRITER
+# ================================================================
+
+def write_structured_grid_vtk(
+    path,
+    x,
+    y,
+    scalars=None,
+    vectors=None,
+    title="Shallow water output"
+):
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if x.shape != y.shape or x.ndim != 2:
+        raise ValueError("x and y must be equally shaped 2D arrays")
+
+    ny, nx = x.shape
+
+    with open(path, "w", encoding="utf-8") as handle:
+
+        handle.write("# vtk DataFile Version 3.0\n")
+        handle.write(f"{title}\n")
+        handle.write("ASCII\n")
+        handle.write("DATASET STRUCTURED_GRID\n")
+
+        handle.write(
+            f"DIMENSIONS {nx} {ny} 1\n"
+        )
+
+        handle.write(
+            f"POINTS {nx * ny} float\n"
+        )
+
+        for j in range(ny):
+
+            for i in range(nx):
+
+                handle.write(
+                    f"{x[j,i]:.12e} "
+                    f"{y[j,i]:.12e} 0\n"
+                )
+
+        handle.write(
+            f"POINT_DATA {nx * ny}\n"
+        )
+
+        for name, field in (scalars or {}).items():
+
+            field = np.asarray(field, dtype=float)
+
+            if field.shape != x.shape:
+                raise ValueError(
+                    f"Invalid dimensions for {name}"
+                )
+
+            handle.write(
+                f"SCALARS {name} float 1\n"
+            )
+
+            handle.write(
+                "LOOKUP_TABLE default\n"
+            )
+
+            for value in field.ravel():
+
+                handle.write(
+                    f"{value:.12e}\n"
+                )
+
+        for name, values in (vectors or {}).items():
+
+            vx = np.asarray(values[0]).ravel()
+            vy = np.asarray(values[1]).ravel()
+
+            handle.write(
+                f"VECTORS {name} float\n"
+            )
+
+            for ax, ay in zip(vx, vy):
+
+                handle.write(
+                    f"{ax:.12e} {ay:.12e} 0\n"
+                )
+
+
+# ================================================================
+# 13. CREATE 3D WATER BODY VISUALIZATION
+# ================================================================
+
+def write_visual(
+    path,
+    x,
+    eta,
+    velocity,
+    depth,
+    scale,
+    nz
+):
+
+    vertical_fraction = np.linspace(
+        0.0,
+        1.0,
+        nz
+    )
+
+    xx = np.repeat(
+        x[None, :],
+        nz,
+        axis=0
+    )
+
+    bottom = -depth * scale
+
+    surface = eta * scale
+
+    yy = (
+        bottom
+        + vertical_fraction[:, None]
+        * (surface[None, :] - bottom)
+    )
+
+    eta_field = np.repeat(
+        eta[None, :],
+        nz,
+        axis=0
+    )
+
+    velocity_field = np.repeat(
+        velocity[None, :],
+        nz,
+        axis=0
+    )
+
+    fraction = np.repeat(
+        vertical_fraction[:, None],
+        x.size,
+        axis=1
+    )
+
+    write_structured_grid_vtk(
+        path,
+        xx,
+        yy,
+        {
+            "surface_elevation": eta_field,
+            "vertical_fraction": fraction,
+            "velocity_magnitude": np.abs(velocity_field)
+        },
+        {
+            "velocity": (
+                velocity_field,
+                np.zeros_like(velocity_field)
+            )
+        },
+        "Shallow water body visualization"
+    )
+
+
+# ================================================================
+# 14. CREATE FREE SURFACE RIBBON
+# ================================================================
+
+def write_surface_ribbon(
+    path,
+    x,
+    eta,
+    scale
+):
+
+    xx = np.repeat(
+        x[None, :],
+        2,
+        axis=0
+    )
+
+    yy = np.vstack((
+        eta * scale - 0.01 * scale,
+        eta * scale + 0.01 * scale
+    ))
+
+    eta_field = np.repeat(
+        eta[None, :],
+        2,
+        axis=0
+    )
+
+    write_structured_grid_vtk(
+        path,
+        xx,
+        yy,
+        {
+            "surface_elevation": eta_field
+        },
+        title="Lake free surface"
+    )
+
+
+# ================================================================
+# 15. SAVE FINAL VTK FILES
+# ================================================================
+
+WRITE_VISUAL_PATH = (
+    OUTPUT_DIR / "lake_water_body_final.vtk"
+)
+
+WRITE_RIBBON_PATH = (
+    OUTPUT_DIR / "lake_surface_scaled_final.vtk"
+)
+
+write_visual(
+    WRITE_VISUAL_PATH,
+    X,
+    ETA_LW,
+    U_LW,
+    DEPTH,
+    VERTICAL_SCALE,
+    NZ_VISUAL
+)
+
+write_surface_ribbon(
+    WRITE_RIBBON_PATH,
+    X,
+    ETA_LW,
+    VERTICAL_SCALE
+)
+
+# ================================================================
+# 16. SAVE SPACE-TIME FIELD
+# ================================================================
+
+SNAPSHOT_ARRAY = np.asarray(
+    SNAPSHOT_ETA
+)
+
+TIME_ARRAY = np.asarray(
+    SNAPSHOT_TIMES
+)
+
+XX = np.repeat(
+    X[None, :],
+    TIME_ARRAY.size,
+    axis=0
+)
+
+TT = np.repeat(
+    TIME_ARRAY[:, None],
+    NX,
+    axis=1
+)
+
+SPACE_TIME_FILE = (
+    OUTPUT_DIR / "lake_space_time.vtk"
+)
+
+write_structured_grid_vtk(
+    SPACE_TIME_FILE,
+    XX,
+    TT,
+    {
+        "surface_elevation": SNAPSHOT_ARRAY
+    },
+    title="Lake wave space-time field"
+)
+
+
+# ================================================================
+# 17. SAVE WAVE HISTORY CSV
+# ================================================================
+
+HISTORY = np.asarray(HISTORY)
+
+HISTORY_FILE = (
+    OUTPUT_DIR / "lake_wave_history.csv"
+)
+
+with open(
+    HISTORY_FILE,
+    "w",
+    newline="",
+    encoding="utf-8"
+) as handle:
+
+    writer = csv.writer(handle)
+
+    writer.writerow([
+        "step",
+        "time",
+        "dt",
+        "CFL",
+        "relative_l2_error_upwind",
+        "relative_l2_error_lax_wendroff",
+        "mass_upwind",
+        "mass_lax_wendroff"
+    ])
+
+    writer.writerows(HISTORY)
+
+
+# ================================================================
+# 18. SAVE FINAL WAVE PROFILES
+# ================================================================
+
+PROFILES_FILE = (
+    OUTPUT_DIR / "lake_wave_profiles.csv"
+)
+
+with open(
+    PROFILES_FILE,
+    "w",
+    newline="",
+    encoding="utf-8"
+) as handle:
+
+    writer = csv.writer(handle)
+
+    writer.writerow([
+        "x",
+        "eta_upwind",
+        "velocity_upwind",
+        "eta_lax_wendroff",
+        "velocity_lax_wendroff",
+        "eta_analytical"
+    ])
+
+    for values in zip(
+        X,
+        ETA_UPWIND,
+        U_UPWIND,
+        ETA_LW,
+        U_LW,
+        ETA_REFERENCE
+    ):
+
+        writer.writerow(values)
+
+
+# ================================================================
+# 19. SAVE NUMERICAL SUMMARY
+# ================================================================
+
+SUMMARY_FILE = (
+    OUTPUT_DIR / "lake_wave_summary.txt"
+)
+
+with open(
+    SUMMARY_FILE,
+    "w",
+    encoding="utf-8"
+) as handle:
+
+    handle.write(
+        "LINEARIZED ONE-DIMENSIONAL SHALLOW WATER EQUATIONS\n"
+    )
+
+    handle.write(f"nx {NX}\n")
+    handle.write(f"length_m {LENGTH:.12e}\n")
+    handle.write(f"mean_depth_m {DEPTH:.12e}\n")
+    handle.write(f"gravity {GRAVITY:.12e}\n")
+    handle.write(f"wave_speed {WAVE_SPEED:.12e}\n")
+
+    handle.write(
+        f"initial_amplitude {AMPLITUDE:.12e}\n"
+    )
+
+    handle.write(f"sigma {SIGMA:.12e}\n")
+    handle.write(f"initial_center {CENTER:.12e}\n")
+    handle.write(f"final_time {TIME:.12e}\n")
+    handle.write(f"time_steps {STEP}\n")
+    handle.write(f"CFL {CFL:.12e}\n")
+
+    handle.write(
+        f"initial_eta_mass {INITIAL_MASS:.12e}\n"
+    )
+
+    handle.write(
+        f"final_eta_mass_upwind {FINAL_MASS_UPWIND:.12e}\n"
+    )
+
+    handle.write(
+        f"final_eta_mass_lax_wendroff {FINAL_MASS_LW:.12e}\n"
+    )
+
+    handle.write(
+        f"relative_L2_error_upwind {FINAL_ERROR_UPWIND:.12e}\n"
+    )
+
+    handle.write(
+        f"relative_L2_error_lax_wendroff {FINAL_ERROR_LW:.12e}\n"
+    )
+
+
+# ================================================================
+# 20. FINAL WAVE PROFILE COMPARISON
+# ================================================================
+
+plt.figure(figsize=(10, 5))
+
+plt.plot(
+    X,
+    ETA_UPWIND,
+    label="Upwind",
+    linewidth=2
+)
+
+plt.plot(
+    X,
+    ETA_LW,
+    label="Lax-Wendroff",
+    linewidth=2
+)
+
+plt.plot(
+    X,
+    ETA_REFERENCE,
+    "--",
+    label="Analytical",
+    linewidth=2
+)
+
+plt.xlabel("Position x (m)")
+plt.ylabel("Surface displacement (m)")
+
+plt.title(
+    "Final Shallow Water Wave Profile"
+)
+
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "final_wave_profile.png",
+    dpi=300
+)
+
+plt.show()
+
+
+# ================================================================
+# 21. ERROR EVOLUTION
+# ================================================================
+
+plt.figure(figsize=(9, 5))
+
+plt.semilogy(
+    HISTORY[:, 1],
+    HISTORY[:, 4],
+    label="Upwind",
+    linewidth=2
+)
+
+plt.semilogy(
+    HISTORY[:, 1],
+    HISTORY[:, 5],
+    label="Lax-Wendroff",
+    linewidth=2
+)
+
+plt.xlabel("Time (s)")
+plt.ylabel("Relative L2 error")
+
+plt.title(
+    "Numerical Error Evolution"
+)
+
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "error_evolution.png",
+    dpi=300
+)
+
+plt.show()
+
+
+# ================================================================
+# 22. MASS CONSERVATION
+# ================================================================
+
+plt.figure(figsize=(9, 5))
+
+plt.plot(
+    HISTORY[:, 1],
+    HISTORY[:, 6],
+    label="Upwind",
+    linewidth=2
+)
+
+plt.plot(
+    HISTORY[:, 1],
+    HISTORY[:, 7],
+    label="Lax-Wendroff",
+    linewidth=2
+)
+
+plt.axhline(
+    INITIAL_MASS,
+    linestyle="--",
+    label="Initial mass"
+)
+
+plt.xlabel("Time (s)")
+plt.ylabel("Integrated surface displacement")
+
+plt.title(
+    "Mass Conservation Comparison"
+)
+
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "mass_conservation.png",
+    dpi=300
+)
+
+plt.show()
+
+
+# ================================================================
+# 23. SPACE-TIME SURFACE CONTOUR
+# ================================================================
+
+plt.figure(figsize=(11, 5))
+
+CONTOUR = plt.contourf(
+    X,
+    TIME_ARRAY,
+    SNAPSHOT_ARRAY,
+    levels=40
+)
+
+plt.colorbar(
+    CONTOUR,
+    label="Surface displacement (m)"
+)
+
+plt.xlabel("Position x (m)")
+plt.ylabel("Time (s)")
+
+plt.title(
+    "Shallow Water Wave Space-Time Evolution"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "space_time_contour.png",
+    dpi=300
+)
+
+plt.show()
+
+
+# ================================================================
+# 24. DISPLAY RESULTS SUMMARY
+# ================================================================
+
+print("\n" + "=" * 65)
+print("FINAL EXPERIMENT SUMMARY")
+print("=" * 65)
+
+print(f"Grid points              : {NX}")
+print(f"Domain length            : {LENGTH} m")
+print(f"Water depth              : {DEPTH} m")
+print(f"Wave speed               : {WAVE_SPEED:.6f} m/s")
+print(f"Time steps               : {STEP}")
+print(f"Final time               : {TIME:.6f} s")
+
+print("-" * 65)
+
+print(
+    f"Upwind L2 error          : {FINAL_ERROR_UPWIND:.8e}"
+)
+
+print(
+    f"Lax-Wendroff L2 error    : {FINAL_ERROR_LW:.8e}"
+)
+
+print("-" * 65)
+
+print(
+    f"Initial mass             : {INITIAL_MASS:.8e}"
+)
+
+print(
+    f"Final Upwind mass        : {FINAL_MASS_UPWIND:.8e}"
+)
+
+print(
+    f"Final Lax-Wendroff mass  : {FINAL_MASS_LW:.8e}"
+)
+
+
+# ================================================================
+# 25. PACKAGE ALL OUTPUT FILES
+# ================================================================
+
+ZIP_FILE = Path(
+    "/content/experiment_07_results.zip"
+)
+
+with zipfile.ZipFile(
+    ZIP_FILE,
+    "w",
+    zipfile.ZIP_DEFLATED
+) as ZIP:
+
+    for FILE in sorted(
+        OUTPUT_DIR.rglob("*")
+    ):
+
+        if FILE.is_file():
+
+            ZIP.write(
+                FILE,
+                FILE.relative_to(OUTPUT_DIR)
+            )
+
+
+# ================================================================
+# 26. LIST GENERATED FILES
+# ================================================================
+
+print("\nGenerated output files:")
+
+for FILE in sorted(
+    OUTPUT_DIR.iterdir()
+):
+
+    if FILE.is_file():
+
+        print(
+            f"{FILE.name:<42}"
+            f"{FILE.stat().st_size / 1024:.2f} KB"
+        )
+
+
+# ================================================================
+# 27. DOWNLOAD RESULTS
+# ================================================================
+
+DOWNLOAD_RESULTS = True
+
+if DOWNLOAD_RESULTS and IN_COLAB:
+
+    print("\nDownloading results ZIP...")
+
+    files.download(
+        str(ZIP_FILE)
+    )
+
+else:
+
+    print(
+        "\nResults ZIP saved at:",
+        ZIP_FILE
+    )
+
+print("\nEXPERIMENT 7 COMPLETED.")
