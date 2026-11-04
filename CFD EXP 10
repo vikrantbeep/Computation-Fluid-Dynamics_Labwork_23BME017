@@ -1,0 +1,1305 @@
+# ================================================================
+# EXPERIMENT 10: TURBULENT PIPE-FLOW MODEL COMPARISON
+# Complete single-cell Google Colab implementation
+#
+# Models:
+# 1. Laminar
+# 2. Mixing Length
+# 3. Van Driest
+# 4. Equilibrium k-epsilon
+# 5. Equilibrium k-omega / SST surrogate
+# ================================================================
+
+import os
+import csv
+import math
+import zipfile
+import shutil
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+try:
+    from google.colab import files
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+# ================================================================
+# 1. PARAMETERS
+# ================================================================
+
+RUN_MODE = "lab"       # "quick", "lab", "custom"
+
+# Custom parameters (used only in custom mode)
+n_radial = 121
+vtk_nx = 160
+vtk_ny = 61
+Re_min = 10000.0
+Re_max = 100000.0
+n_Re = 3
+max_iterations = 1500
+tolerance = 1e-7
+
+DOWNLOAD_RESULTS = True
+
+QUICK_ARGS = [
+    21, 30, 21, 10000, 12000, 1, 8, 0.0001
+]
+
+LAB_ARGS = [
+    121, 160, 61, 10000, 100000, 3, 1500, 1e-7
+]
+
+CUSTOM_ARGS = [
+    n_radial, vtk_nx, vtk_ny,
+    Re_min, Re_max, n_Re,
+    max_iterations, tolerance
+]
+
+ARGS = (
+    QUICK_ARGS if RUN_MODE == "quick"
+    else LAB_ARGS if RUN_MODE == "lab"
+    else CUSTOM_ARGS
+)
+
+(
+    n_radial, vtk_nx, vtk_ny,
+    Re_min, Re_max, n_Re,
+    max_iterations, tolerance
+) = ARGS
+
+print("Experiment 10: Turbulent Pipe-Flow Models")
+print("Run mode:", RUN_MODE)
+print("Parameters:", ARGS)
+
+# ================================================================
+# 2. OUTPUT DIRECTORIES
+# ================================================================
+
+ROOT = (
+    Path("/content/cfd_lab_exp10")
+    if IN_COLAB
+    else Path.cwd() / "cfd_lab_exp10"
+)
+
+if ROOT.exists():
+    shutil.rmtree(ROOT)
+
+ROOT.mkdir(parents=True, exist_ok=True)
+
+OUT = ROOT / "outputs"
+OUT.mkdir(parents=True, exist_ok=True)
+
+# ================================================================
+# 3. NUMERICAL UTILITIES
+# ================================================================
+
+def tdma(a, b, c, d):
+
+    a = np.asarray(a, dtype=float).copy()
+    b = np.asarray(b, dtype=float).copy()
+    c = np.asarray(c, dtype=float).copy()
+    d = np.asarray(d, dtype=float).copy()
+
+    n = d.size
+
+    if n == 0 or any(arr.size != n for arr in [a, b, c]):
+        raise ValueError("TDMA arrays must have equal nonzero size")
+
+    for i in range(1, n):
+
+        if abs(b[i-1]) < 1e-30:
+            raise FloatingPointError("Zero TDMA pivot")
+
+        factor = a[i] / b[i-1]
+
+        b[i] -= factor*c[i-1]
+        d[i] -= factor*d[i-1]
+
+    x = np.empty(n)
+
+    if abs(b[-1]) < 1e-30:
+        raise FloatingPointError("Zero TDMA pivot")
+
+    x[-1] = d[-1]/b[-1]
+
+    for i in range(n-2, -1, -1):
+
+        if abs(b[i]) < 1e-30:
+            raise FloatingPointError("Zero TDMA pivot")
+
+        x[i] = (
+            d[i] - c[i]*x[i+1]
+        )/b[i]
+
+    return x
+
+
+def bulk_velocity(radius, velocity, pipe_radius, dr):
+
+    return (
+        2.0*np.sum(velocity*radius)*dr
+        /(pipe_radius**2)
+    )
+
+
+def relative_l2(numerical, reference):
+
+    denominator = np.linalg.norm(reference.ravel())
+    numerator = np.linalg.norm(
+        (numerical-reference).ravel()
+    )
+
+    return numerator/max(denominator, 1e-30)
+
+
+# ================================================================
+# 4. TURBULENCE MODEL SOLVER
+# ================================================================
+
+class ModelResult:
+
+    def __init__(
+        self, name, reynolds, nu, friction,
+        u_tau, pressure_drop, residual,
+        iterations, radius, velocity,
+        nut, k, epsilon, omega
+    ):
+
+        self.name = name
+        self.reynolds = reynolds
+        self.nu = nu
+        self.friction = friction
+        self.u_tau = u_tau
+        self.pressure_drop = pressure_drop
+        self.residual = residual
+        self.iterations = iterations
+        self.radius = radius
+        self.velocity = velocity
+        self.nut = nut
+        self.k = k
+        self.epsilon = epsilon
+        self.omega = omega
+
+
+def solve_model(
+    model, name, n, reynolds,
+    max_iterations, tolerance
+):
+
+    pipe_radius = 0.5
+    diameter = 1.0
+    target_bulk = 1.0
+
+    nu = target_bulk*diameter/reynolds
+
+    dr = pipe_radius/n
+
+    radius = (np.arange(n)+0.5)*dr
+
+    velocity = 2.0*(
+        1.0-(radius/pipe_radius)**2
+    )
+
+    nut = np.zeros(n)
+    k = np.zeros(n)
+    epsilon = np.zeros(n)
+    omega_field = np.zeros(n)
+
+    kappa = 0.41
+    a_plus = 26.0
+    c_mu = 0.09
+    beta_star = 0.09
+    a1 = 0.31
+
+    friction_initial = (
+        0.3164*max(reynolds, 4000.0)**(-0.25)
+    )
+
+    u_tau = math.sqrt(
+        max(friction_initial/8.0, 1e-12)
+    )
+
+    residual = 1.0
+    completed = 0
+
+    for iteration in range(1, max_iterations+1):
+
+        old = velocity.copy()
+
+        derivative = np.gradient(
+            velocity, dr, edge_order=2
+        )
+
+        wall_distance = np.maximum(
+            pipe_radius-radius, 0.5*dr
+        )
+
+        y_plus = wall_distance*u_tau/nu
+
+        damping = 1.0-np.exp(-y_plus/a_plus)
+
+        strain = np.abs(derivative)
+
+        k.fill(0.0)
+        epsilon.fill(0.0)
+        omega_field.fill(0.0)
+
+        # --------------------------------------------------------
+        # MODEL 0: LAMINAR
+        # --------------------------------------------------------
+
+        if model == 0:
+
+            nut.fill(0.0)
+
+        # --------------------------------------------------------
+        # MODEL 1: MIXING LENGTH
+        # --------------------------------------------------------
+
+        elif model == 1:
+
+            mixing_length = kappa*wall_distance
+
+            nut = mixing_length**2*strain
+
+        # --------------------------------------------------------
+        # MODEL 2: VAN DRIEST
+        # --------------------------------------------------------
+
+        elif model == 2:
+
+            mixing_length = (
+                kappa*wall_distance*damping
+            )
+
+            nut = mixing_length**2*strain
+
+        # --------------------------------------------------------
+        # MODEL 3: EQUILIBRIUM K-EPSILON
+        # --------------------------------------------------------
+
+        elif model == 3:
+
+            kdamp = 1.0-np.exp(-y_plus/12.0)
+
+            k = (
+                u_tau**2/math.sqrt(c_mu)
+            )*kdamp**2
+
+            y_use = np.maximum(
+                wall_distance,
+                1.5*nu/max(u_tau, 1e-12)
+            )
+
+            epsilon = (
+                c_mu**0.75
+                *np.maximum(k, 1e-16)**1.5
+                /(kappa*y_use)
+            )
+
+            nut = (
+                c_mu*k**2
+                /np.maximum(epsilon, 1e-18)
+                *damping**2
+            )
+
+        # --------------------------------------------------------
+        # MODEL 4: EQUILIBRIUM K-OMEGA / SST SURROGATE
+        # --------------------------------------------------------
+
+        elif model == 4:
+
+            kdamp = 1.0-np.exp(-y_plus/10.0)
+
+            k = (
+                u_tau**2/math.sqrt(beta_star)
+            )*kdamp**2
+
+            y_use = np.maximum(
+                wall_distance,
+                1.5*nu/max(u_tau, 1e-12)
+            )
+
+            omega_field = (
+                u_tau
+                /(math.sqrt(beta_star)*kappa*y_use)
+            )
+
+            f2_arg = (
+                2.0*np.sqrt(np.maximum(k, 0.0))
+                /np.maximum(
+                    beta_star*omega_field*y_use,
+                    1e-18
+                )
+            )
+
+            f2 = np.tanh(
+                np.maximum(f2_arg, 0.0)**2
+            )
+
+            denominator = np.maximum(
+                a1*omega_field,
+                strain*f2
+            )
+
+            nut = (
+                a1*k
+                /np.maximum(denominator, 1e-18)
+                *damping**2
+            )
+
+            epsilon = beta_star*k*omega_field
+
+        else:
+
+            raise ValueError("Unknown turbulence model")
+
+        # Limit eddy viscosity
+        nut = np.clip(nut, 0.0, 300.0*nu)
+
+        effective = nu+nut
+
+        # --------------------------------------------------------
+        # RADIAL MOMENTUM EQUATION
+        # --------------------------------------------------------
+
+        a = np.zeros(n)
+        b = np.zeros(n)
+        c = np.zeros(n)
+
+        rhs = radius*dr
+
+        for i in range(n):
+
+            diagonal = 0.0
+
+            if i > 0:
+
+                rw = i*dr
+
+                nuw = 0.5*(
+                    effective[i]+effective[i-1]
+                )
+
+                aw = rw*nuw/dr
+
+                a[i] = -aw
+                diagonal += aw
+
+            re = (i+1)*dr
+
+            if i < n-1:
+
+                nue = 0.5*(
+                    effective[i]+effective[i+1]
+                )
+
+                ae = re*nue/dr
+
+                c[i] = -ae
+                diagonal += ae
+
+            else:
+
+                ae = re*nu/(0.5*dr)
+
+                diagonal += ae
+
+            b[i] = diagonal
+
+        candidate = tdma(a, b, c, rhs)
+
+        # Maintain unit bulk velocity
+        candidate *= (
+            target_bulk
+            /max(
+                bulk_velocity(
+                    radius, candidate,
+                    pipe_radius, dr
+                ),
+                1e-30
+            )
+        )
+
+        # Wall friction velocity
+        wall_gradient = (
+            0.0-candidate[-1]
+        )/(0.5*dr)
+
+        new_u_tau = math.sqrt(
+            max(nu*abs(wall_gradient), 1e-18)
+        )
+
+        relax = 1.0 if model == 0 else 0.45
+
+        velocity = (
+            relax*candidate
+            +(1.0-relax)*velocity
+        )
+
+        residual = (
+            np.linalg.norm(velocity-old)
+            /max(np.linalg.norm(old), 1e-30)
+        )
+
+        u_tau = (
+            0.35*new_u_tau+0.65*u_tau
+        )
+
+        completed = iteration
+
+        if residual < tolerance and iteration > 20:
+            break
+
+    friction = 8.0*u_tau**2
+
+    pressure_drop = friction*10.0*0.5
+
+    return ModelResult(
+        name, reynolds, nu,
+        friction, u_tau, pressure_drop,
+        residual, completed,
+        radius, velocity, nut,
+        k, epsilon, omega_field
+    )
+
+
+# ================================================================
+# 5. INTERPOLATION
+# ================================================================
+
+def radial_interpolate(result, radial_position):
+
+    pipe_radius = 0.5
+
+    xp = np.concatenate((
+        [0.0],
+        result.radius,
+        [pipe_radius]
+    ))
+
+    fp = np.concatenate((
+        [result.velocity[0]],
+        result.velocity,
+        [0.0]
+    ))
+
+    return np.interp(radial_position, xp, fp)
+
+
+def interpolate_field(
+    radius, values, radial_position,
+    wall_value=0.0
+):
+
+    pipe_radius = 0.5
+
+    xp = np.concatenate((
+        [0.0], radius, [pipe_radius]
+    ))
+
+    fp = np.concatenate((
+        [values[0]], values, [wall_value]
+    ))
+
+    return np.interp(radial_position, xp, fp)
+
+
+# ================================================================
+# 6. VTK WRITERS
+# ================================================================
+
+def write_structured_grid_vtk(
+    path, x, y, scalars=None,
+    vectors=None, title="Pipe flow"
+):
+
+    ny, nx = x.shape
+
+    scalars = scalars or {}
+    vectors = vectors or {}
+
+    with open(path, "w") as f:
+
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write(title+"\n")
+        f.write("ASCII\n")
+        f.write("DATASET STRUCTURED_GRID\n")
+        f.write(f"DIMENSIONS {nx} {ny} 1\n")
+        f.write(f"POINTS {nx*ny} float\n")
+
+        for j in range(ny):
+            for i in range(nx):
+                f.write(
+                    f"{x[j,i]:.12e} "
+                    f"{y[j,i]:.12e} 0\n"
+                )
+
+        f.write(f"POINT_DATA {nx*ny}\n")
+
+        for name, values in scalars.items():
+
+            f.write(f"SCALARS {name} float 1\n")
+            f.write("LOOKUP_TABLE default\n")
+
+            for value in values.ravel():
+                f.write(f"{value:.12e}\n")
+
+        for name, values in vectors.items():
+
+            f.write(f"VECTORS {name} float\n")
+
+            for vx, vy in zip(
+                values[0].ravel(),
+                values[1].ravel()
+            ):
+
+                f.write(
+                    f"{vx:.12e} {vy:.12e} 0\n"
+                )
+
+
+def write_multiline_vtk(path, lines):
+
+    points = []
+    connectivity = []
+
+    for x_line, y_line in lines:
+
+        ids = list(
+            range(len(points), len(points)+len(x_line))
+        )
+
+        points.extend(zip(x_line.tolist(), y_line.tolist()))
+        connectivity.append(ids)
+
+    size = sum(
+        len(ids)+1 for ids in connectivity
+    )
+
+    with open(path, "w") as f:
+
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write("Pipe walls\n")
+        f.write("ASCII\n")
+        f.write("DATASET POLYDATA\n")
+        f.write(f"POINTS {len(points)} float\n")
+
+        for x_value, y_value in points:
+            f.write(f"{x_value} {y_value} 0\n")
+
+        f.write(f"LINES {len(connectivity)} {size}\n")
+
+        for ids in connectivity:
+            f.write(
+                f"{len(ids)} "
+                +" ".join(map(str, ids))
+                +"\n"
+            )
+
+
+# ================================================================
+# 7. MAIN SOLVER
+# ================================================================
+
+def run_solver(
+    n_radial, vtk_nx, vtk_ny,
+    Re_min, Re_max, n_Re,
+    max_iterations, tolerance,
+    output_dir
+):
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if (
+        n_radial < 21 or
+        vtk_nx < 10 or
+        vtk_ny < 11 or
+        Re_min <= 0 or
+        Re_max < Re_min or
+        n_Re < 1 or
+        max_iterations < 1 or
+        tolerance <= 0
+    ):
+
+        raise ValueError("Invalid simulation parameters.")
+
+    models = [
+        (0, "laminar"),
+        (1, "mixing_length"),
+        (2, "van_driest"),
+        (3, "kepsilon"),
+        (4, "komega_sst")
+    ]
+
+    if n_Re == 1:
+        reynolds_values = np.array([Re_min])
+    else:
+        reynolds_values = np.geomspace(
+            Re_min, Re_max, n_Re
+        )
+
+    summary_rows = []
+
+    all_results = {}
+
+    for reynolds in reynolds_values:
+
+        results = []
+
+        print("\n"+"="*70)
+        print(f"REYNOLDS NUMBER: {reynolds:.2f}")
+        print("="*70)
+
+        for model, name in models:
+
+            result = solve_model(
+                model,
+                name,
+                n_radial,
+                float(reynolds),
+                max_iterations,
+                tolerance
+            )
+
+            results.append(result)
+
+            all_results[
+                (float(reynolds), name)
+            ] = result
+
+            blasius = (
+                0.3164*reynolds**(-0.25)
+            )
+
+            haaland = (
+                1.0/(
+                    -1.8*np.log10(6.9/reynolds)
+                )**2
+            )
+
+            summary_rows.append([
+                reynolds,
+                name,
+                result.friction,
+                blasius,
+                haaland,
+                result.u_tau,
+                result.pressure_drop,
+                result.velocity[0],
+                np.max(result.nut/result.nu),
+                result.iterations,
+                result.residual
+            ])
+
+            print(
+                f"{name:15s} | "
+                f"friction = {result.friction:.6e} | "
+                f"U_center = {result.velocity[0]:.6e} | "
+                f"residual = {result.residual:.6e}"
+            )
+
+        # --------------------------------------------------------
+        # 2D EXTRUDED PIPE FIELD
+        # --------------------------------------------------------
+
+        x1 = np.linspace(0.0, 10.0, vtk_nx)
+        y1 = np.linspace(-0.5, 0.5, vtk_ny)
+
+        x, y = np.meshgrid(x1, y1)
+
+        radial_position = np.abs(y)
+
+        scalars = {}
+        vectors = {}
+
+        for result in results:
+
+            velocity_profile = radial_interpolate(
+                result, radial_position
+            )
+
+            nut_ratio = interpolate_field(
+                result.radius,
+                result.nut/result.nu,
+                radial_position
+            )
+
+            k_field = interpolate_field(
+                result.radius,
+                result.k,
+                radial_position
+            )
+
+            epsilon_field = interpolate_field(
+                result.radius,
+                result.epsilon,
+                radial_position
+            )
+
+            omega_field = interpolate_field(
+                result.radius,
+                result.omega,
+                radial_position
+            )
+
+            pressure = (
+                result.pressure_drop
+                *(1.0-x/10.0)
+            )
+
+            scalars[f"U_{result.name}"] = velocity_profile
+
+            scalars[
+                f"nut_over_nu_{result.name}"
+            ] = nut_ratio
+
+            scalars[f"pressure_{result.name}"] = pressure
+            scalars[f"k_{result.name}"] = k_field
+
+            scalars[
+                f"epsilon_{result.name}"
+            ] = epsilon_field
+
+            scalars[
+                f"omega_{result.name}"
+            ] = omega_field
+
+            vectors[
+                f"velocity_{result.name}"
+            ] = (
+                velocity_profile,
+                np.zeros_like(velocity_profile)
+            )
+
+        tag = f"{reynolds:.0f}"
+
+        write_structured_grid_vtk(
+            output_dir/f"pipe2d_compare_Re{tag}.vtk",
+            x, y,
+            scalars,
+            vectors,
+            "2D axisymmetric pipe turbulence-model comparison"
+        )
+
+        # --------------------------------------------------------
+        # PROFILE CSV
+        # --------------------------------------------------------
+
+        with open(
+            output_dir/f"pipe2d_profiles_Re{tag}.csv",
+            "w",
+            newline=""
+        ) as f:
+
+            writer = csv.writer(f)
+
+            header = ["r_over_R"]
+
+            for result in results:
+
+                header.extend([
+                    f"U_{result.name}",
+                    f"nut_over_nu_{result.name}",
+                    f"k_{result.name}",
+                    f"epsilon_{result.name}",
+                    f"omega_{result.name}"
+                ])
+
+            writer.writerow(header)
+
+            for i in range(n_radial):
+
+                row = [
+                    results[0].radius[i]/0.5
+                ]
+
+                for result in results:
+
+                    row.extend([
+                        result.velocity[i],
+                        result.nut[i]/result.nu,
+                        result.k[i],
+                        result.epsilon[i],
+                        result.omega[i]
+                    ])
+
+                writer.writerow(row)
+
+    # ============================================================
+    # 8. SUMMARY CSV
+    # ============================================================
+
+    with open(
+        output_dir/"pipe2d_rans_summary.csv",
+        "w",
+        newline=""
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "Re",
+            "model",
+            "friction_factor_Darcy",
+            "Blasius_reference",
+            "Haaland_smooth_reference",
+            "uTau",
+            "pressure_drop_over_10D",
+            "U_center",
+            "maximum_nut_over_nu",
+            "iterations",
+            "residual"
+        ])
+
+        writer.writerows(summary_rows)
+
+    # Pipe wall VTK
+    write_multiline_vtk(
+        output_dir/"pipe2d_walls.vtk",
+        [
+            (
+                np.array([0.0, 10.0]),
+                np.array([-0.5, -0.5])
+            ),
+            (
+                np.array([0.0, 10.0]),
+                np.array([0.5, 0.5])
+            )
+        ]
+    )
+
+    summary_text = """
+TURBULENT PIPE-FLOW MODEL COMPARISON
+
+Models:
+1. Laminar
+2. Mixing Length
+3. Van Driest
+4. Equilibrium k-epsilon
+5. Equilibrium k-omega / SST surrogate
+
+The model solves radial eddy-viscosity closures
+and extrudes the profile along the pipe axis.
+
+This is a teaching-level 2D axisymmetric fully
+developed pipe-flow model.
+
+It is NOT a full industrial two-equation RANS
+transport solver.
+
+Compare friction factors with Blasius and
+Haaland reference values in the summary CSV.
+"""
+
+    (output_dir/"pipe2d_rans_summary.txt").write_text(
+        summary_text
+    )
+
+    print("\nSolver completed.")
+    print(summary_text)
+
+    return all_results, summary_rows
+
+
+# ================================================================
+# 9. RUN SIMULATION
+# ================================================================
+
+results, summary_rows = run_solver(
+    n_radial,
+    vtk_nx,
+    vtk_ny,
+    Re_min,
+    Re_max,
+    n_Re,
+    max_iterations,
+    tolerance,
+    OUT
+)
+
+
+# ================================================================
+# 10. FRICTION FACTOR COMPARISON
+# ================================================================
+
+summary = np.genfromtxt(
+    OUT/"pipe2d_rans_summary.csv",
+    delimiter=",",
+    names=True,
+    dtype=None,
+    encoding="utf-8"
+)
+
+summary = np.atleast_1d(summary)
+
+plt.figure(figsize=(9, 5))
+
+for model in np.unique(summary["model"]):
+
+    mask = summary["model"] == model
+
+    plt.loglog(
+        summary["Re"][mask],
+        summary["friction_factor_Darcy"][mask],
+        marker="o",
+        label=str(model)
+    )
+
+reference_re = np.unique(summary["Re"])
+
+reference_blasius = np.array([
+    summary["Blasius_reference"][
+        summary["Re"] == value
+    ][0]
+    for value in reference_re
+])
+
+reference_haaland = np.array([
+    summary["Haaland_smooth_reference"][
+        summary["Re"] == value
+    ][0]
+    for value in reference_re
+])
+
+plt.loglog(
+    reference_re,
+    reference_blasius,
+    "k--",
+    label="Blasius"
+)
+
+plt.loglog(
+    reference_re,
+    reference_haaland,
+    "k-.",
+    label="Haaland"
+)
+
+plt.xlabel("Reynolds number")
+plt.ylabel("Darcy friction factor")
+plt.title("Friction-Factor Comparison")
+plt.legend(fontsize=8)
+plt.grid(True, which="both")
+plt.tight_layout()
+
+plt.savefig(
+    OUT/"friction_factor_comparison.png",
+    dpi=200
+)
+
+plt.show()
+
+
+# ================================================================
+# 11. VELOCITY PROFILE COMPARISON
+# ================================================================
+
+profile_files = sorted(
+    OUT.glob("pipe2d_profiles_Re*.csv")
+)
+
+for profile_file in profile_files:
+
+    profiles = np.genfromtxt(
+        profile_file,
+        delimiter=",",
+        names=True,
+        dtype=None,
+        encoding="utf-8"
+    )
+
+    profiles = np.atleast_1d(profiles)
+
+    plt.figure(figsize=(8, 5))
+
+    for field in profiles.dtype.names:
+
+        if field.startswith("U_"):
+
+            plt.plot(
+                profiles[field],
+                profiles["r_over_R"],
+                label=field[2:]
+            )
+
+    plt.xlabel("Mean velocity")
+    plt.ylabel("r/R")
+    plt.title(
+        f"Velocity Profiles - {profile_file.stem}"
+    )
+
+    plt.legend(fontsize=8)
+    plt.grid(True)
+    plt.tight_layout()
+
+    filename = (
+        profile_file.stem+"_velocity.png"
+    )
+
+    plt.savefig(
+        OUT/filename,
+        dpi=200
+    )
+
+    plt.show()
+
+
+# ================================================================
+# 12. EDDY VISCOSITY RATIO COMPARISON
+# ================================================================
+
+for profile_file in profile_files:
+
+    profiles = np.genfromtxt(
+        profile_file,
+        delimiter=",",
+        names=True,
+        dtype=None,
+        encoding="utf-8"
+    )
+
+    profiles = np.atleast_1d(profiles)
+
+    plt.figure(figsize=(8, 5))
+
+    for field in profiles.dtype.names:
+
+        if field.startswith("nut_over_nu_"):
+
+            plt.plot(
+                profiles[field],
+                profiles["r_over_R"],
+                label=field.replace("nut_over_nu_", "")
+            )
+
+    plt.xlabel("Turbulent viscosity ratio (nu_t / nu)")
+    plt.ylabel("r/R")
+    plt.title(
+        f"Eddy Viscosity Ratio - {profile_file.stem}"
+    )
+
+    plt.legend(fontsize=8)
+    plt.grid(True)
+    plt.tight_layout()
+
+    filename = (
+        profile_file.stem+"_eddy_viscosity.png"
+    )
+
+    plt.savefig(
+        OUT/filename,
+        dpi=200
+    )
+
+    plt.show()
+
+
+# ================================================================
+# 13. PRESSURE DROP COMPARISON
+# ================================================================
+
+plt.figure(figsize=(8, 5))
+
+for model in np.unique(summary["model"]):
+
+    mask = summary["model"] == model
+
+    plt.plot(
+        summary["Re"][mask],
+        summary["pressure_drop_over_10D"][mask],
+        marker="o",
+        label=str(model)
+    )
+
+plt.xlabel("Reynolds number")
+plt.ylabel("Pressure drop over 10D")
+plt.title("Pressure Drop Comparison")
+plt.legend(fontsize=8)
+plt.grid(True)
+plt.tight_layout()
+
+plt.savefig(
+    OUT/"pressure_drop_comparison.png",
+    dpi=200
+)
+
+plt.show()
+
+
+# ================================================================
+# 14. INLINE VTK FIELD VISUALIZATION
+# ================================================================
+
+def read_vtk_scalar(path, field_name):
+
+    lines = Path(path).read_text().splitlines()
+
+    dims_index = next(
+        i for i, line in enumerate(lines)
+        if line.startswith("DIMENSIONS ")
+    )
+
+    _, nx, ny, nz = lines[dims_index].split()
+
+    nx, ny = int(nx), int(ny)
+
+    points_index = next(
+        i for i, line in enumerate(lines)
+        if line.startswith("POINTS ")
+    )
+
+    npoints = int(lines[points_index].split()[1])
+
+    points = np.array([
+        [
+            float(v)
+            for v in lines[points_index+1+k].split()[:3]
+        ]
+        for k in range(npoints)
+    ])
+
+    x = points[:, 0].reshape(ny, nx)
+    y = points[:, 1].reshape(ny, nx)
+
+    field_index = next(
+        i for i, line in enumerate(lines)
+        if line.startswith(f"SCALARS {field_name} ")
+    )
+
+    values_start = field_index+2
+
+    values = np.array([
+        float(lines[values_start+k].split()[0])
+        for k in range(npoints)
+    ])
+
+    return x, y, values.reshape(ny, nx)
+
+
+vtk_file = OUT/"pipe2d_compare_Re10000.vtk"
+
+if vtk_file.exists():
+
+    x, y, velocity_field = read_vtk_scalar(
+        vtk_file,
+        "U_mixing_length"
+    )
+
+    plt.figure(figsize=(9, 4.5))
+
+    contour = plt.contourf(
+        x, y, velocity_field,
+        levels=30,
+        cmap="viridis"
+    )
+
+    plt.colorbar(
+        contour,
+        label="Velocity"
+    )
+
+    plt.xlabel("Axial position")
+    plt.ylabel("Radial position")
+    plt.title(
+        "Pipe Velocity Field - Mixing Length Model"
+    )
+
+    plt.axis("equal")
+    plt.tight_layout()
+
+    plt.savefig(
+        OUT/"pipe_velocity_field.png",
+        dpi=200
+    )
+
+    plt.show()
+
+
+# ================================================================
+# 15. NUMERICAL SUMMARY TABLE
+# ================================================================
+
+print("\nFRICTION FACTOR AND MODEL SUMMARY")
+print("-"*105)
+
+print(
+    f"{'Re':<12}"
+    f"{'Model':<18}"
+    f"{'Friction':<16}"
+    f"{'Blasius':<16}"
+    f"{'Haaland':<16}"
+    f"{'Max nu_t/nu':<16}"
+)
+
+for row in summary_rows:
+
+    print(
+        f"{row[0]:<12.0f}"
+        f"{row[1]:<18}"
+        f"{row[2]:<16.6e}"
+        f"{row[3]:<16.6e}"
+        f"{row[4]:<16.6e}"
+        f"{row[8]:<16.5f}"
+    )
+
+
+# ================================================================
+# 16. GENERATED FILES
+# ================================================================
+
+print("\nGENERATED FILES")
+print("-"*65)
+
+for path in sorted(OUT.rglob("*")):
+
+    if path.is_file():
+
+        size = path.stat().st_size/1024
+
+        print(
+            f"{path.relative_to(OUT)} "
+            f"({size:.1f} KB)"
+        )
+
+
+# ================================================================
+# 17. ZIP AND DOWNLOAD
+# ================================================================
+
+ZIP_PATH = ROOT/"experiment_10_results.zip"
+
+if ZIP_PATH.exists():
+    ZIP_PATH.unlink()
+
+with zipfile.ZipFile(
+    ZIP_PATH,
+    "w",
+    compression=zipfile.ZIP_DEFLATED
+) as archive:
+
+    for path in OUT.rglob("*"):
+
+        if path.is_file():
+
+            archive.write(
+                path,
+                path.relative_to(OUT)
+            )
+
+print("\nResults ZIP:", ZIP_PATH)
+print(
+    f"ZIP size: {ZIP_PATH.stat().st_size/1024:.1f} KB"
+)
+
+if DOWNLOAD_RESULTS:
+
+    if IN_COLAB:
+        files.download(str(ZIP_PATH))
+    else:
+        print("ZIP saved locally:", ZIP_PATH)
+
+print("\nEXPERIMENT 10 COMPLETED.")
