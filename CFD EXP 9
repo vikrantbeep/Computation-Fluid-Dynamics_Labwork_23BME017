@@ -1,0 +1,1014 @@
+# ================================================================
+# EXPERIMENT 9: LID-DRIVEN CAVITY FLOW
+# Complete single-cell Google Colab code
+# Vorticity-Streamfunction Formulation
+# ================================================================
+
+import os
+import csv
+import zipfile
+import shutil
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+try:
+    from google.colab import files
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+# ----------------------- 1. PARAMETERS ---------------------------
+
+RUN_MODE = "lab"       # Options: "quick", "lab", "custom"
+
+# Custom parameters (used only when RUN_MODE = "custom")
+nx = 65
+ny = 65
+Re = 100.0
+U_lid = 1.0
+max_steps = 2000
+output_every = 500
+poisson_iterations = 60
+tolerance = 1e-8
+CFL = 0.8
+SOR = 1.7
+
+# Download ZIP automatically at the end
+DOWNLOAD_RESULTS = True
+
+# Run compulsory Re = 100 and Re = 400 comparison
+RUN_RE_COMPARISON = True
+
+if RUN_MODE == "quick":
+    ARGS = [21, 21, 100.0, 1.0, 10, 10, 10, 1e-5, 0.8, 1.5]
+
+elif RUN_MODE == "lab":
+    ARGS = [65, 65, 100.0, 1.0, 2000, 500, 60, 1e-8, 0.8, 1.7]
+
+else:
+    ARGS = [
+        nx, ny, Re, U_lid, max_steps,
+        output_every, poisson_iterations,
+        tolerance, CFL, SOR
+    ]
+
+nx, ny, Re, U_lid, max_steps, output_every, poisson_iterations, tolerance, CFL, SOR = ARGS
+
+print("Run mode:", RUN_MODE)
+print("Parameters:", ARGS)
+
+# ----------------------- 2. OUTPUT DIRECTORIES ------------------
+
+ROOT = Path("/content/cfd_lab_exp09") if IN_COLAB else Path.cwd() / "cfd_lab_exp09"
+
+if ROOT.exists():
+    shutil.rmtree(ROOT)
+
+ROOT.mkdir(parents=True, exist_ok=True)
+OUT = ROOT / "outputs"
+OUT.mkdir(parents=True, exist_ok=True)
+
+
+# ----------------------- 3. NUMERICAL UTILITIES ------------------
+
+def laplacian(field, dx, dy):
+    result = np.zeros_like(field)
+
+    result[1:-1, 1:-1] = (
+        (field[1:-1, 2:] - 2*field[1:-1, 1:-1]
+         + field[1:-1, :-2]) / dx**2
+        +
+        (field[2:, 1:-1] - 2*field[1:-1, 1:-1]
+         + field[:-2, 1:-1]) / dy**2
+    )
+
+    return result
+
+
+def upwind_derivative_x(field, velocity, dx):
+    result = np.zeros_like(field)
+
+    backward = (
+        field[1:-1, 1:-1] - field[1:-1, :-2]
+    ) / dx
+
+    forward = (
+        field[1:-1, 2:] - field[1:-1, 1:-1]
+    ) / dx
+
+    result[1:-1, 1:-1] = np.where(
+        velocity[1:-1, 1:-1] >= 0,
+        backward,
+        forward
+    )
+
+    return result
+
+
+def upwind_derivative_y(field, velocity, dy):
+    result = np.zeros_like(field)
+
+    backward = (
+        field[1:-1, 1:-1] - field[:-2, 1:-1]
+    ) / dy
+
+    forward = (
+        field[2:, 1:-1] - field[1:-1, 1:-1]
+    ) / dy
+
+    result[1:-1, 1:-1] = np.where(
+        velocity[1:-1, 1:-1] >= 0,
+        backward,
+        forward
+    )
+
+    return result
+
+
+def require_finite(*arrays):
+    for array in arrays:
+        if not np.all(np.isfinite(array)):
+            raise FloatingPointError(
+                "Non-finite numerical field detected."
+            )
+
+
+# ----------------------- 4. STREAMFUNCTION SOLVER ----------------
+
+def solve_streamfunction(psi, omega, dx, dy, iterations, sor):
+
+    dx2 = dx**2
+    dy2 = dy**2
+
+    denominator = 2.0/dx2 + 2.0/dy2
+
+    ny, nx = psi.shape
+
+    jj, ii = np.indices((ny-2, nx-2))
+
+    residual = 0.0
+
+    for _ in range(iterations):
+
+        residual = 0.0
+
+        for parity in (0, 1):
+
+            active = ((ii + jj) % 2) == parity
+
+            candidate = (
+                (psi[1:-1, 2:] + psi[1:-1, :-2])/dx2
+                +
+                (psi[2:, 1:-1] + psi[:-2, 1:-1])/dy2
+                +
+                omega[1:-1, 1:-1]
+            ) / denominator
+
+            old = psi[1:-1, 1:-1].copy()
+
+            updated = np.where(
+                active,
+                (1-sor)*old + sor*candidate,
+                old
+            )
+
+            psi[1:-1, 1:-1] = updated
+
+            residual = max(
+                residual,
+                float(np.max(np.abs(updated-old)))
+            )
+
+        # Streamfunction boundary conditions
+        psi[0, :] = 0.0
+        psi[-1, :] = 0.0
+        psi[:, 0] = 0.0
+        psi[:, -1] = 0.0
+
+    return residual
+
+
+# ----------------------- 5. VELOCITY CALCULATION -----------------
+
+def velocity_from_streamfunction(psi, dx, dy, lid_speed):
+
+    u = np.zeros_like(psi)
+    v = np.zeros_like(psi)
+
+    u[1:-1, 1:-1] = (
+        psi[2:, 1:-1] - psi[:-2, 1:-1]
+    ) / (2*dy)
+
+    v[1:-1, 1:-1] = -(
+        psi[1:-1, 2:] - psi[1:-1, :-2]
+    ) / (2*dx)
+
+    # Moving top wall
+    u[-1, :] = lid_speed
+
+    # Stationary walls
+    u[0, :] = 0.0
+    u[:, 0] = 0.0
+    u[:, -1] = 0.0
+
+    v[0, :] = 0.0
+    v[-1, :] = 0.0
+    v[:, 0] = 0.0
+    v[:, -1] = 0.0
+
+    return u, v
+
+
+# ----------------------- 6. WALL VORTICITY -----------------------
+
+def set_wall_vorticity(omega, psi, dx, dy, lid_speed):
+
+    # Bottom wall
+    omega[0, 1:-1] = (
+        -2.0*psi[1, 1:-1]/dy**2
+    )
+
+    # Moving top wall
+    omega[-1, 1:-1] = (
+        -2.0*psi[-2, 1:-1]/dy**2
+        - 2.0*lid_speed/dy
+    )
+
+    # Left wall
+    omega[1:-1, 0] = (
+        -2.0*psi[1:-1, 1]/dx**2
+    )
+
+    # Right wall
+    omega[1:-1, -1] = (
+        -2.0*psi[1:-1, -2]/dx**2
+    )
+
+    # Corner values
+    omega[0, 0] = 0.5*(omega[0, 1] + omega[1, 0])
+    omega[0, -1] = 0.5*(omega[0, -2] + omega[1, -1])
+    omega[-1, 0] = 0.5*(omega[-1, 1] + omega[-2, 0])
+    omega[-1, -1] = 0.5*(omega[-1, -2] + omega[-2, -1])
+
+
+# ----------------------- 7. VTK FILE WRITERS ---------------------
+
+def write_structured_grid_vtk(
+    path, x, y, scalars=None, vectors=None,
+    title="Lid-driven cavity"
+):
+
+    ny, nx = x.shape
+    scalars = scalars or {}
+    vectors = vectors or {}
+
+    with open(path, "w") as f:
+
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write(title + "\n")
+        f.write("ASCII\n")
+        f.write("DATASET STRUCTURED_GRID\n")
+        f.write(f"DIMENSIONS {nx} {ny} 1\n")
+        f.write(f"POINTS {nx*ny} float\n")
+
+        for j in range(ny):
+            for i in range(nx):
+                f.write(f"{x[j,i]} {y[j,i]} 0\n")
+
+        f.write(f"POINT_DATA {nx*ny}\n")
+
+        for name, values in scalars.items():
+
+            f.write(f"SCALARS {name} float 1\n")
+            f.write("LOOKUP_TABLE default\n")
+
+            for value in values.ravel():
+                f.write(f"{value:.12e}\n")
+
+        for name, values in vectors.items():
+
+            f.write(f"VECTORS {name} float\n")
+
+            for a, b in zip(
+                values[0].ravel(),
+                values[1].ravel()
+            ):
+                f.write(f"{a:.12e} {b:.12e} 0\n")
+
+
+def write_multiline_vtk(path, lines, title="Cavity boundaries"):
+
+    points = []
+    connectivity = []
+
+    for x_line, y_line in lines:
+
+        ids = list(range(len(points), len(points)+len(x_line)))
+
+        points.extend(zip(x_line.tolist(), y_line.tolist()))
+        connectivity.append(ids)
+
+    total = sum(len(ids)+1 for ids in connectivity)
+
+    with open(path, "w") as f:
+
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write(title + "\n")
+        f.write("ASCII\n")
+        f.write("DATASET POLYDATA\n")
+        f.write(f"POINTS {len(points)} float\n")
+
+        for x_value, y_value in points:
+            f.write(f"{x_value} {y_value} 0\n")
+
+        f.write(f"LINES {len(connectivity)} {total}\n")
+
+        for ids in connectivity:
+            f.write(f"{len(ids)} " + " ".join(map(str, ids)) + "\n")
+
+
+def write_points_vtk(path, x, y, title="Streamline seeds"):
+
+    with open(path, "w") as f:
+
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write(title + "\n")
+        f.write("ASCII\n")
+        f.write("DATASET POLYDATA\n")
+        f.write(f"POINTS {len(x)} float\n")
+
+        for a, b in zip(x, y):
+            f.write(f"{a} {b} 0\n")
+
+        f.write(f"VERTICES {len(x)} {2*len(x)}\n")
+
+        for i in range(len(x)):
+            f.write(f"1 {i}\n")
+
+
+# ----------------------- 8. MAIN SIMULATION ----------------------
+
+def run_simulation(
+    nx, ny, reynolds, lid_speed,
+    max_steps, output_every,
+    poisson_iterations, tolerance,
+    cfl, sor, output_dir
+):
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if nx < 11 or ny < 11:
+        raise ValueError("Grid dimensions must be at least 11.")
+
+    if reynolds <= 0 or lid_speed <= 0:
+        raise ValueError("Reynolds number and lid speed must be positive.")
+
+    if not 0 < sor < 2:
+        raise ValueError("SOR must be between 0 and 2.")
+
+    # Square cavity: 1 x 1
+    x1 = np.linspace(0.0, 1.0, nx)
+    y1 = np.linspace(0.0, 1.0, ny)
+
+    x, y = np.meshgrid(x1, y1)
+
+    dx = x1[1] - x1[0]
+    dy = y1[1] - y1[0]
+
+    # Kinematic viscosity
+    nu = lid_speed/reynolds
+
+    # Time step
+    dt_convective = 0.25*cfl*min(dx, dy)/lid_speed
+
+    dt_viscous = (
+        0.05*min(dx**2, dy**2)/nu
+    )
+
+    dt = min(dt_convective, dt_viscous)
+
+    print("\n" + "="*65)
+    print(f"RUNNING LID-DRIVEN CAVITY: Re = {reynolds}")
+    print("="*65)
+    print(f"Grid: {nx} x {ny}")
+    print(f"Lid velocity: {lid_speed}")
+    print(f"Kinematic viscosity: {nu:.6e}")
+    print(f"Time step: {dt:.6e}")
+
+    # Initialize fields
+    psi = np.zeros((ny, nx))
+    omega = np.zeros((ny, nx))
+    u = np.zeros((ny, nx))
+    v = np.zeros((ny, nx))
+
+    history = []
+    completed_steps = 0
+
+    # ---------------- TIME LOOP ----------------
+
+    for step in range(1, max_steps+1):
+
+        # Solve streamfunction Poisson equation
+        poisson_residual = solve_streamfunction(
+            psi, omega, dx, dy,
+            poisson_iterations, sor
+        )
+
+        # Calculate velocity
+        u, v = velocity_from_streamfunction(
+            psi, dx, dy, lid_speed
+        )
+
+        # Apply wall-vorticity boundary conditions
+        set_wall_vorticity(
+            omega, psi, dx, dy, lid_speed
+        )
+
+        old = omega.copy()
+
+        # Convective terms
+        convection = (
+            u*upwind_derivative_x(old, u, dx)
+            +
+            v*upwind_derivative_y(old, v, dy)
+        )
+
+        # Vorticity transport equation
+        diffusion = laplacian(old, dx, dy)
+
+        omega[1:-1, 1:-1] = (
+            old[1:-1, 1:-1]
+            +
+            dt*(
+                -convection[1:-1, 1:-1]
+                +
+                nu*diffusion[1:-1, 1:-1]
+            )
+        )
+
+        # Reapply boundary conditions
+        set_wall_vorticity(
+            omega, psi, dx, dy, lid_speed
+        )
+
+        # Convergence measure
+        change = float(
+            np.sqrt(
+                np.mean(
+                    (omega[1:-1, 1:-1]
+                     - old[1:-1, 1:-1])**2
+                )
+            )
+        )
+
+        max_speed = float(
+            np.max(np.sqrt(u**2 + v**2))
+        )
+
+        current_time = step*dt
+
+        history.append([
+            step,
+            current_time,
+            change,
+            poisson_residual,
+            max_speed
+        ])
+
+        completed_steps = step
+
+        require_finite(psi, omega, u, v)
+
+        if (
+            step == 1
+            or step == max_steps
+            or step % output_every == 0
+        ):
+
+            print(
+                f"Step {step:5d} | "
+                f"Time {current_time:.5f} | "
+                f"Vorticity change {change:.4e} | "
+                f"Poisson residual {poisson_residual:.4e}"
+            )
+
+        # Intermediate VTK output
+        if step % output_every == 0:
+
+            write_structured_grid_vtk(
+                output_dir/f"cavity_{step:06d}.vtk",
+                x, y,
+                {
+                    "streamfunction": psi,
+                    "vorticity": omega,
+                    "speed": np.sqrt(u**2+v**2)
+                },
+                {"velocity": (u, v)},
+                "Lid-driven cavity"
+            )
+
+        # Steady-state convergence check
+        if change < tolerance and step > 100:
+            print("\nConvergence tolerance reached.")
+            break
+
+    # Final solution
+    solve_streamfunction(
+        psi, omega, dx, dy,
+        poisson_iterations, sor
+    )
+
+    u, v = velocity_from_streamfunction(
+        psi, dx, dy, lid_speed
+    )
+
+    speed = np.sqrt(u**2+v**2)
+
+    # Final VTK field
+    write_structured_grid_vtk(
+        output_dir/"cavity_final.vtk",
+        x, y,
+        {
+            "streamfunction": psi,
+            "vorticity": omega,
+            "speed": speed
+        },
+        {"velocity": (u, v)},
+        "Lid-driven cavity final"
+    )
+
+    # Cavity boundary geometry
+    write_multiline_vtk(
+        output_dir/"cavity_boundaries.vtk",
+        [
+            (np.array([0.0, 1.0]), np.array([0.0, 0.0])),
+            (np.array([1.0, 1.0]), np.array([0.0, 1.0])),
+            (np.array([1.0, 0.0]), np.array([1.0, 1.0])),
+            (np.array([0.0, 0.0]), np.array([1.0, 0.0]))
+        ]
+    )
+
+    # Streamline seed points
+    seed = np.linspace(0.05, 0.95, 15)
+    sx, sy = np.meshgrid(seed, seed)
+
+    write_points_vtk(
+        output_dir/"cavity_stream_seeds.vtk",
+        sx.ravel(),
+        sy.ravel()
+    )
+
+    # Centreline indices
+    i_mid = int(np.argmin(np.abs(x1-0.5)))
+    j_mid = int(np.argmin(np.abs(y1-0.5)))
+
+    # Centreline velocity profiles
+    with open(
+        output_dir/"cavity_centerline_profiles.csv",
+        "w", newline=""
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "vertical_y",
+            "u_at_x_0p5",
+            "horizontal_x",
+            "v_at_y_0p5"
+        ])
+
+        nrows = max(nx, ny)
+
+        for k in range(nrows):
+
+            j = min(
+                int(round(k*(ny-1)/max(nrows-1, 1))),
+                ny-1
+            )
+
+            i = min(
+                int(round(k*(nx-1)/max(nrows-1, 1))),
+                nx-1
+            )
+
+            writer.writerow([
+                y1[j],
+                u[j, i_mid],
+                x1[i],
+                v[j_mid, i]
+            ])
+
+    # Convergence history
+    with open(
+        output_dir/"cavity_history.csv",
+        "w", newline=""
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "step",
+            "time",
+            "vorticity_change_l2",
+            "poisson_residual_linf",
+            "maximum_speed"
+        ])
+
+        writer.writerows(history)
+
+    # Primary vortex position
+    minimum_index = np.unravel_index(
+        np.argmin(psi),
+        psi.shape
+    )
+
+    vortex_x = x1[minimum_index[1]]
+    vortex_y = y1[minimum_index[0]]
+
+    final_change = history[-1][2]
+
+    summary = f"""
+LID-DRIVEN CAVITY FLOW - NUMERICAL SUMMARY
+
+Grid:
+nx = {nx}
+ny = {ny}
+
+Flow parameters:
+Reynolds number = {reynolds}
+Lid velocity = {lid_speed}
+Kinematic viscosity = {nu:.12e}
+
+Numerical parameters:
+Time step = {dt:.12e}
+CFL = {cfl}
+SOR factor = {sor}
+Poisson iterations = {poisson_iterations}
+Convergence tolerance = {tolerance}
+
+Simulation:
+Completed steps = {completed_steps}
+Final simulation time = {completed_steps*dt:.12e}
+
+Convergence:
+Final vorticity change L2 = {final_change:.12e}
+
+Primary vortex:
+Minimum streamfunction = {np.min(psi):.12e}
+Primary vortex x position = {vortex_x:.12e}
+Primary vortex y position = {vortex_y:.12e}
+
+Benchmark requirement:
+Compare centreline velocities with Ghia, Ghia and Shin.
+Grid independence and benchmark validation are student tasks.
+"""
+
+    (output_dir/"cavity_summary.txt").write_text(summary)
+
+    print(summary)
+
+    return {
+        "x": x,
+        "y": y,
+        "u": u,
+        "v": v,
+        "psi": psi,
+        "omega": omega,
+        "speed": speed,
+        "history": np.array(history),
+        "profiles": {
+            "y": y1,
+            "u": u[:, i_mid],
+            "x": x1,
+            "v": v[j_mid, :]
+        },
+        "vortex_x": vortex_x,
+        "vortex_y": vortex_y,
+        "summary": summary,
+        "steps": completed_steps,
+        "dt": dt,
+        "Re": reynolds
+    }
+
+
+# ----------------------- 9. RUN MAIN CASE ------------------------
+
+main_dir = OUT/"Re_100"
+
+main_result = run_simulation(
+    nx, ny, Re, U_lid,
+    max_steps, output_every,
+    poisson_iterations, tolerance,
+    CFL, SOR, main_dir
+)
+
+
+# ----------------------- 10. MAIN CASE PLOTS ---------------------
+
+# Vertical centreline velocity
+plt.figure(figsize=(7, 5))
+
+plt.plot(
+    main_result["profiles"]["u"],
+    main_result["profiles"]["y"],
+    label=f"Re = {Re}"
+)
+
+plt.xlabel("u velocity")
+plt.ylabel("y")
+plt.title("Vertical Centreline Velocity")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.savefig(OUT/"vertical_centreline_velocity.png", dpi=200)
+plt.show()
+
+
+# Horizontal centreline velocity
+plt.figure(figsize=(7, 5))
+
+plt.plot(
+    main_result["profiles"]["x"],
+    main_result["profiles"]["v"],
+    label=f"Re = {Re}"
+)
+
+plt.xlabel("x")
+plt.ylabel("v velocity")
+plt.title("Horizontal Centreline Velocity")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.savefig(OUT/"horizontal_centreline_velocity.png", dpi=200)
+plt.show()
+
+
+# Convergence history
+history = main_result["history"]
+
+plt.figure(figsize=(8, 4))
+
+plt.semilogy(
+    history[:, 0],
+    np.maximum(history[:, 2], 1e-18)
+)
+
+plt.xlabel("Iteration")
+plt.ylabel("Vorticity-change L2 norm")
+plt.title("Approach to Steady State")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(OUT/"convergence_history.png", dpi=200)
+plt.show()
+
+
+# Streamfunction contour
+plt.figure(figsize=(7, 6))
+
+contour = plt.contourf(
+    main_result["x"],
+    main_result["y"],
+    main_result["psi"],
+    levels=35,
+    cmap="viridis"
+)
+
+plt.colorbar(contour, label="Streamfunction")
+plt.xlabel("x")
+plt.ylabel("y")
+plt.title(f"Streamfunction Contour - Re = {Re}")
+plt.axis("equal")
+plt.tight_layout()
+plt.savefig(OUT/"streamfunction_contour.png", dpi=200)
+plt.show()
+
+
+# Vorticity contour
+plt.figure(figsize=(7, 6))
+
+contour = plt.contourf(
+    main_result["x"],
+    main_result["y"],
+    main_result["omega"],
+    levels=35,
+    cmap="coolwarm"
+)
+
+plt.colorbar(contour, label="Vorticity")
+plt.xlabel("x")
+plt.ylabel("y")
+plt.title(f"Vorticity Contour - Re = {Re}")
+plt.axis("equal")
+plt.tight_layout()
+plt.savefig(OUT/"vorticity_contour.png", dpi=200)
+plt.show()
+
+
+# Velocity magnitude
+plt.figure(figsize=(7, 6))
+
+contour = plt.contourf(
+    main_result["x"],
+    main_result["y"],
+    main_result["speed"],
+    levels=35,
+    cmap="viridis"
+)
+
+plt.colorbar(contour, label="Velocity magnitude")
+plt.xlabel("x")
+plt.ylabel("y")
+plt.title(f"Velocity Magnitude - Re = {Re}")
+plt.axis("equal")
+plt.tight_layout()
+plt.savefig(OUT/"velocity_magnitude.png", dpi=200)
+plt.show()
+
+
+# ----------------------- 11. REYNOLDS COMPARISON -----------------
+# Compulsory assignment: Re = 100 and Re = 400
+
+comparison_results = [main_result]
+
+if RUN_RE_COMPARISON:
+
+    print("\nRunning compulsory Reynolds-number comparison...")
+
+    # If main case is already Re=100, only run Re=400 additionally.
+    if Re != 100.0:
+
+        result_100 = run_simulation(
+            nx, ny, 100.0, U_lid,
+            max_steps, output_every,
+            poisson_iterations, tolerance,
+            CFL, SOR, OUT/"Re_100"
+        )
+
+        comparison_results.append(result_100)
+
+    result_400 = run_simulation(
+        nx, ny, 400.0, U_lid,
+        max_steps, output_every,
+        poisson_iterations, tolerance,
+        CFL, SOR, OUT/"Re_400"
+    )
+
+    comparison_results.append(result_400)
+
+    comparison_results.sort(key=lambda item: item["Re"])
+
+    # Compare vertical centreline velocities
+    plt.figure(figsize=(7, 5))
+
+    for result in comparison_results:
+
+        plt.plot(
+            result["profiles"]["u"],
+            result["profiles"]["y"],
+            label=f"Re = {result['Re']:.0f}"
+        )
+
+    plt.xlabel("u velocity")
+    plt.ylabel("y")
+    plt.title("Vertical Centreline Velocity Comparison")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUT/"Re_comparison_vertical_velocity.png", dpi=200)
+    plt.show()
+
+    # Compare horizontal centreline velocities
+    plt.figure(figsize=(7, 5))
+
+    for result in comparison_results:
+
+        plt.plot(
+            result["profiles"]["x"],
+            result["profiles"]["v"],
+            label=f"Re = {result['Re']:.0f}"
+        )
+
+    plt.xlabel("x")
+    plt.ylabel("v velocity")
+    plt.title("Horizontal Centreline Velocity Comparison")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUT/"Re_comparison_horizontal_velocity.png", dpi=200)
+    plt.show()
+
+    # Compare convergence
+    plt.figure(figsize=(8, 5))
+
+    for result in comparison_results:
+
+        h = result["history"]
+
+        plt.semilogy(
+            h[:, 0],
+            np.maximum(h[:, 2], 1e-18),
+            label=f"Re = {result['Re']:.0f}"
+        )
+
+    plt.xlabel("Iteration")
+    plt.ylabel("Vorticity-change L2 norm")
+    plt.title("Convergence Comparison")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUT/"Re_comparison_convergence.png", dpi=200)
+    plt.show()
+
+    # Compare primary vortex positions
+    print("\nPRIMARY VORTEX POSITIONS")
+    print("-"*55)
+    print(f"{'Reynolds number':<20}{'X position':<15}{'Y position':<15}")
+
+    for result in comparison_results:
+
+        print(
+            f"{result['Re']:<20.0f}"
+            f"{result['vortex_x']:<15.5f}"
+            f"{result['vortex_y']:<15.5f}"
+        )
+
+    # Save comparison data
+    with open(OUT/"Re_comparison_summary.csv", "w", newline="") as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "Reynolds number",
+            "Primary vortex x",
+            "Primary vortex y",
+            "Final vorticity change",
+            "Completed steps",
+            "Final simulation time"
+        ])
+
+        for result in comparison_results:
+
+            writer.writerow([
+                result["Re"],
+                result["vortex_x"],
+                result["vortex_y"],
+                result["history"][-1, 2],
+                result["steps"],
+                result["steps"]*result["dt"]
+            ])
+
+
+# ----------------------- 12. GENERATED FILES --------------------
+
+print("\nGENERATED FILES")
+print("-"*65)
+
+for path in sorted(OUT.rglob("*")):
+
+    if path.is_file():
+
+        size = path.stat().st_size/1024
+
+        print(
+            f"{path.relative_to(OUT)} "
+            f"({size:.1f} KB)"
+        )
+
+
+# ----------------------- 13. ZIP DOWNLOAD -----------------------
+
+ZIP_PATH = ROOT/"experiment_09_results.zip"
+
+if ZIP_PATH.exists():
+    ZIP_PATH.unlink()
+
+with zipfile.ZipFile(
+    ZIP_PATH,
+    "w",
+    compression=zipfile.ZIP_DEFLATED
+) as archive:
+
+    for path in OUT.rglob("*"):
+
+        if path.is_file():
+
+            archive.write(
+                path,
+                path.relative_to(OUT)
+            )
+
+print("\nResults ZIP created:", ZIP_PATH)
+print(f"ZIP size: {ZIP_PATH.stat().st_size/1024:.1f} KB")
+
+if DOWNLOAD_RESULTS:
+
+    if IN_COLAB:
+        files.download(str(ZIP_PATH))
+
+    else:
+        print("Results saved locally at:", ZIP_PATH)
+
+
+print("\nEXPERIMENT 9 COMPLETED.")
