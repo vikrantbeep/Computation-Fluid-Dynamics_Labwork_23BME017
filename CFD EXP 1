@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 
 # ==============================================================================
 # 0. PARAMETERS - students edit only this block
-# ==============================================================================
+
 NX, NY = 120, 60  # number of grid POINTS in x and y
 RE = 100.0  # Reynolds number Re = U_inf * chord / nu
 ALPHA_DEG = -16.0  # angle of attack in degrees
