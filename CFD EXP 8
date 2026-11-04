@@ -1,0 +1,886 @@
+# ================================================================
+# EXPERIMENT 8: RAYLEIGH-TAYLOR INSTABILITY (VOF)
+# Complete single-cell Google Colab code
+# ================================================================
+
+import os
+import csv
+import math
+import zipfile
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+from IPython.display import display, Markdown
+
+try:
+    from google.colab import files
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+# ----------------------- 1. PARAMETERS ---------------------------
+
+RUN_MODE = "lab"       # Options: "quick", "lab", "custom"
+
+# Custom parameters (used only when RUN_MODE = "custom")
+nx = 96
+ny = 192
+Atwood = 0.5
+gravity = 1.0
+nu = 0.0008
+t_end = 2.0
+max_steps = 800
+poisson_iterations = 60
+output_every = 200
+
+# Download the ZIP automatically at the end
+DOWNLOAD_RESULTS = True
+
+# Run the compulsory Atwood-number comparison
+RUN_ATWOOD_COMPARISON = True
+
+if RUN_MODE == "quick":
+    ARGS = [32, 64, 0.5, 1.0, 0.001, 0.02, 5, 5, 5]
+elif RUN_MODE == "lab":
+    ARGS = [96, 192, 0.5, 1.0, 0.0008, 2.0, 800, 60, 200]
+else:
+    ARGS = [
+        nx, ny, Atwood, gravity, nu, t_end,
+        max_steps, poisson_iterations, output_every
+    ]
+
+nx, ny, Atwood, gravity, nu, t_end, max_steps, poisson_iterations, output_every = ARGS
+
+print("Run mode:", RUN_MODE)
+print("Parameters:", ARGS)
+
+# ----------------------- 2. OUTPUT FOLDERS -----------------------
+
+ROOT = Path("/content/cfd_lab_exp08") if IN_COLAB else Path.cwd() / "cfd_lab_exp08"
+ROOT.mkdir(parents=True, exist_ok=True)
+
+# ----------------------- 3. NUMERICAL UTILITIES ------------------
+
+def apply_velocity_bc(u, v):
+    u[:, 0] = u[:, -1] = 0.0
+    u[0, :] = u[-1, :] = 0.0
+    v[:, 0] = v[:, -1] = 0.0
+    v[0, :] = v[-1, :] = 0.0
+
+
+def gradient(field, dx, dy):
+    gy, gx = np.gradient(field, dy, dx, edge_order=2)
+    return gx, gy
+
+
+def laplacian(field, dx, dy):
+    out = np.zeros_like(field)
+
+    out[1:-1, 1:-1] = (
+        (field[1:-1, 2:] - 2*field[1:-1, 1:-1]
+         + field[1:-1, :-2]) / dx**2
+        +
+        (field[2:, 1:-1] - 2*field[1:-1, 1:-1]
+         + field[:-2, 1:-1]) / dy**2
+    )
+
+    return out
+
+
+def upwind_derivative_x(field, velocity, dx):
+    out = np.zeros_like(field)
+
+    backward = (
+        field[1:-1, 1:-1] - field[1:-1, :-2]
+    ) / dx
+
+    forward = (
+        field[1:-1, 2:] - field[1:-1, 1:-1]
+    ) / dx
+
+    out[1:-1, 1:-1] = np.where(
+        velocity[1:-1, 1:-1] >= 0,
+        backward,
+        forward
+    )
+
+    return out
+
+
+def upwind_derivative_y(field, velocity, dy):
+    out = np.zeros_like(field)
+
+    backward = (
+        field[1:-1, 1:-1] - field[:-2, 1:-1]
+    ) / dy
+
+    forward = (
+        field[2:, 1:-1] - field[1:-1, 1:-1]
+    ) / dy
+
+    out[1:-1, 1:-1] = np.where(
+        velocity[1:-1, 1:-1] >= 0,
+        backward,
+        forward
+    )
+
+    return out
+
+
+def poisson_jacobi(phi, rhs, dx, dy, iterations):
+    dx2 = dx**2
+    dy2 = dy**2
+    denominator = 2*(dx2 + dy2)
+
+    for _ in range(iterations):
+        old = phi.copy()
+
+        phi[1:-1, 1:-1] = (
+            (old[1:-1, 2:] + old[1:-1, :-2])*dy2
+            +
+            (old[2:, 1:-1] + old[:-2, 1:-1])*dx2
+            -
+            rhs[1:-1, 1:-1]*dx2*dy2
+        ) / denominator
+
+        # Closed-domain pressure boundary conditions
+        phi[:, 0] = phi[:, 1]
+        phi[:, -1] = phi[:, -2]
+        phi[0, :] = phi[1, :]
+        phi[-1, :] = phi[-2, :]
+
+        phi -= np.mean(phi)
+
+    return phi
+
+
+# ----------------------- 4. VOF ADVECTION ------------------------
+
+def advect_conservative(volume_fraction, u, v, dt, dx, dy):
+
+    ny, nx = volume_fraction.shape
+
+    flux_x = np.zeros((ny, nx+1))
+    flux_y = np.zeros((ny+1, nx))
+
+    u_face = 0.5*(u[:, :-1] + u[:, 1:])
+    v_face = 0.5*(v[:-1, :] + v[1:, :])
+
+    flux_x[:, 1:nx] = (
+        u_face *
+        np.where(
+            u_face >= 0,
+            volume_fraction[:, :-1],
+            volume_fraction[:, 1:]
+        )
+    )
+
+    flux_y[1:ny, :] = (
+        v_face *
+        np.where(
+            v_face >= 0,
+            volume_fraction[:-1, :],
+            volume_fraction[1:, :]
+        )
+    )
+
+    updated = volume_fraction - dt * (
+        (flux_x[:, 1:] - flux_x[:, :-1])/dx
+        +
+        (flux_y[1:, :] - flux_y[:-1, :])/dy
+    )
+
+    # Preserve the original integrated volume fraction
+    target_sum = float(np.sum(volume_fraction))
+
+    # Enforce boundedness
+    updated = np.clip(updated, 0.0, 1.0)
+
+    # Correct small mass changes caused by clipping
+    for _ in range(4):
+        difference = target_sum - float(np.sum(updated))
+
+        if abs(difference) < 1e-12:
+            break
+
+        weights = updated*(1.0 - updated) + 1e-6
+        updated += difference*weights/np.sum(weights)
+        updated = np.clip(updated, 0.0, 1.0)
+
+    return updated
+
+
+def interface_coordinates(volume_fraction, x, y):
+    indices = np.argmin(np.abs(volume_fraction - 0.5), axis=0)
+
+    return (
+        x[0, :].copy(),
+        y[indices, np.arange(volume_fraction.shape[1])]
+    )
+
+
+# ----------------------- 5. VTK WRITERS -------------------------
+
+def write_structured_grid_vtk(path, x, y, scalars, vectors, title):
+
+    ny, nx = x.shape
+
+    with open(path, "w") as f:
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write(title + "\n")
+        f.write("ASCII\n")
+        f.write("DATASET STRUCTURED_GRID\n")
+        f.write(f"DIMENSIONS {nx} {ny} 1\n")
+        f.write(f"POINTS {nx*ny} float\n")
+
+        for j in range(ny):
+            for i in range(nx):
+                f.write(f"{x[j,i]} {y[j,i]} 0\n")
+
+        f.write(f"POINT_DATA {nx*ny}\n")
+
+        for name, values in scalars.items():
+            f.write(f"SCALARS {name} float 1\n")
+            f.write("LOOKUP_TABLE default\n")
+
+            for value in values.ravel():
+                f.write(f"{value:.12e}\n")
+
+        for name, values in vectors.items():
+            f.write(f"VECTORS {name} float\n")
+
+            for a, b in zip(values[0].ravel(), values[1].ravel()):
+                f.write(f"{a:.12e} {b:.12e} 0\n")
+
+
+def write_points_vtk(path, x, y, title):
+
+    with open(path, "w") as f:
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write(title + "\n")
+        f.write("ASCII\n")
+        f.write("DATASET POLYDATA\n")
+        f.write(f"POINTS {len(x)} float\n")
+
+        for a, b in zip(x, y):
+            f.write(f"{a:.12e} {b:.12e} 0\n")
+
+        f.write(f"VERTICES {len(x)} {2*len(x)}\n")
+
+        for i in range(len(x)):
+            f.write(f"1 {i}\n")
+
+
+def write_boundary_vtk(path, length, height):
+
+    lines = [
+        [(0, 0), (length, 0)],
+        [(length, 0), (length, height)],
+        [(length, height), (0, height)],
+        [(0, height), (0, 0)]
+    ]
+
+    points = []
+    connectivity = []
+
+    for line in lines:
+        ids = []
+
+        for point in line:
+            ids.append(len(points))
+            points.append(point)
+
+        connectivity.append(ids)
+
+    with open(path, "w") as f:
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write("RTI domain boundary\n")
+        f.write("ASCII\n")
+        f.write("DATASET POLYDATA\n")
+        f.write(f"POINTS {len(points)} float\n")
+
+        for a, b in points:
+            f.write(f"{a} {b} 0\n")
+
+        f.write(f"LINES {len(connectivity)} 12\n")
+
+        for ids in connectivity:
+            f.write(f"2 {ids[0]} {ids[1]}\n")
+
+
+# ----------------------- 6. MAIN SOLVER --------------------------
+
+def run_simulation(
+    nx, ny, atwood, gravity, nu, end_time,
+    max_steps, poisson_iterations, output_every,
+    output_dir
+):
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if (
+        nx < 24 or ny < 48 or
+        not 0 < atwood < 0.95 or
+        gravity <= 0 or nu <= 0 or end_time <= 0
+    ):
+        raise ValueError("Invalid simulation parameters.")
+
+    length = 0.5
+    height = 1.0
+
+    x1 = np.linspace(0, length, nx)
+    y1 = np.linspace(0, height, ny)
+    x, y = np.meshgrid(x1, y1)
+
+    dx = x1[1] - x1[0]
+    dy = y1[1] - y1[0]
+
+    # Initial perturbed interface
+    interface = (
+        0.5*height
+        + 0.02*height*np.cos(2*np.pi*x/length)
+    )
+
+    smoothing = 1.5*dy
+
+    volume_fraction = 0.5*(
+        1 + np.tanh((y-interface)/smoothing)
+    )
+
+    u = np.zeros_like(volume_fraction)
+    v = np.zeros_like(volume_fraction)
+    p = np.zeros_like(volume_fraction)
+
+    apply_velocity_bc(u, v)
+
+    rho_heavy = 1.0 + atwood
+    rho_light = 1.0 - atwood
+
+    initial_mass = float(np.sum(volume_fraction)*dx*dy)
+
+    history = []
+    time = 0.0
+    completed_steps = 0
+
+    print(f"\nStarting simulation: Atwood = {atwood}")
+
+    for step in range(1, max_steps+1):
+
+        speed_max = max(
+            float(np.max(np.sqrt(u*u + v*v))),
+            1e-8
+        )
+
+        dt_convective = 0.25*min(dx, dy)/speed_max
+        dt_viscous = 0.15*min(dx*dx, dy*dy)/nu
+
+        dt = min(dt_convective, dt_viscous, end_time-time)
+
+        if dt <= 1e-14:
+            break
+
+        # Velocity derivatives
+        du_dx = upwind_derivative_x(u, u, dx)
+        du_dy = upwind_derivative_y(u, v, dy)
+
+        dv_dx = upwind_derivative_x(v, u, dx)
+        dv_dy = upwind_derivative_y(v, v, dy)
+
+        # Buoyancy force
+        buoyancy = -gravity*atwood*(2*volume_fraction - 1)
+
+        # Predictor step
+        us = u + dt*(
+            -(u*du_dx + v*du_dy)
+            + nu*laplacian(u, dx, dy)
+        )
+
+        vs = v + dt*(
+            -(u*dv_dx + v*dv_dy)
+            + nu*laplacian(v, dx, dy)
+            + buoyancy
+        )
+
+        apply_velocity_bc(us, vs)
+
+        # Pressure Poisson equation
+        rhs = np.zeros_like(p)
+
+        rhs[1:-1, 1:-1] = (
+            (us[1:-1, 2:] - us[1:-1, :-2])/(2*dx)
+            +
+            (vs[2:, 1:-1] - vs[:-2, 1:-1])/(2*dy)
+        )/dt
+
+        rhs -= np.mean(rhs)
+
+        phi = poisson_jacobi(
+            np.zeros_like(p),
+            rhs,
+            dx,
+            dy,
+            poisson_iterations
+        )
+
+        gx, gy = gradient(phi, dx, dy)
+
+        # Velocity correction
+        u = us - dt*gx
+        v = vs - dt*gy
+
+        p += phi
+
+        apply_velocity_bc(u, v)
+
+        # Advect volume fraction
+        volume_fraction = advect_conservative(
+            volume_fraction, u, v, dt, dx, dy
+        )
+
+        time += dt
+        completed_steps = step
+
+        density = (
+            rho_light
+            + (rho_heavy-rho_light)*volume_fraction
+        )
+
+        # Divergence
+        divergence = np.zeros_like(u)
+
+        divergence[1:-1, 1:-1] = (
+            (u[1:-1, 2:] - u[1:-1, :-2])/(2*dx)
+            +
+            (v[2:, 1:-1] - v[:-2, 1:-1])/(2*dy)
+        )
+
+        div_l2 = float(
+            np.sqrt(np.mean(divergence[1:-1, 1:-1]**2))
+        )
+
+        # Interface and mixing-layer measurements
+        interface_x, interface_y = interface_coordinates(
+            volume_fraction, x, y
+        )
+
+        spike = float(np.min(interface_y))
+        bubble = float(np.max(interface_y))
+        mixing_width = bubble-spike
+
+        mass = float(np.sum(volume_fraction)*dx*dy)
+        mass_error = (
+            (mass-initial_mass)/max(initial_mass, 1e-30)
+        )
+
+        history.append([
+            step, time, dt, div_l2,
+            spike, bubble, mixing_width,
+            mass, mass_error,
+            float(np.min(volume_fraction)),
+            float(np.max(volume_fraction))
+        ])
+
+        if not (
+            np.all(np.isfinite(u)) and
+            np.all(np.isfinite(v)) and
+            np.all(np.isfinite(p)) and
+            np.all(np.isfinite(volume_fraction))
+        ):
+            raise FloatingPointError("Non-finite numerical values detected.")
+
+        if step % output_every == 0 or time >= end_time-1e-14:
+
+            vorticity = np.zeros_like(u)
+
+            vorticity[1:-1, 1:-1] = (
+                (v[1:-1, 2:] - v[1:-1, :-2])/(2*dx)
+                -
+                (u[2:, 1:-1] - u[:-2, 1:-1])/(2*dy)
+            )
+
+            write_structured_grid_vtk(
+                output_dir/f"rti_{step:06d}.vtk",
+                x, y,
+                {
+                    "heavy_fluid_fraction": volume_fraction,
+                    "density": density,
+                    "pressure": p,
+                    "vorticity": vorticity,
+                    "speed": np.sqrt(u*u+v*v)
+                },
+                {"velocity": (u, v)},
+                "Rayleigh-Taylor instability"
+            )
+
+            write_points_vtk(
+                output_dir/f"rti_interface_{step:06d}.vtk",
+                interface_x,
+                interface_y,
+                "RTI interface"
+            )
+
+            print(
+                f"Step {step:4d} | Time {time:.4f} | "
+                f"Mixing width {mixing_width:.5f} | "
+                f"Mass error {mass_error:.3e}"
+            )
+
+        if time >= end_time-1e-14:
+            break
+
+    # Final fields
+    density = (
+        rho_light
+        + (rho_heavy-rho_light)*volume_fraction
+    )
+
+    vorticity = np.zeros_like(u)
+
+    vorticity[1:-1, 1:-1] = (
+        (v[1:-1, 2:] - v[1:-1, :-2])/(2*dx)
+        -
+        (u[2:, 1:-1] - u[:-2, 1:-1])/(2*dy)
+    )
+
+    write_structured_grid_vtk(
+        output_dir/"rti_final.vtk",
+        x, y,
+        {
+            "heavy_fluid_fraction": volume_fraction,
+            "density": density,
+            "pressure": p,
+            "vorticity": vorticity,
+            "speed": np.sqrt(u*u+v*v)
+        },
+        {"velocity": (u, v)},
+        "Rayleigh-Taylor instability final"
+    )
+
+    interface_x, interface_y = interface_coordinates(
+        volume_fraction, x, y
+    )
+
+    write_points_vtk(
+        output_dir/"rti_interface_final.vtk",
+        interface_x,
+        interface_y,
+        "RTI final interface"
+    )
+
+    write_boundary_vtk(
+        output_dir/"rti_domain_boundary.vtk",
+        length, height
+    )
+
+    # Save history CSV
+    header = [
+        "step", "time", "dt", "divergence_l2",
+        "spike_position", "bubble_position",
+        "mixing_width", "heavy_fluid_mass",
+        "relative_mass_error",
+        "minimum_fraction", "maximum_fraction"
+    ]
+
+    with open(output_dir/"rti_history.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(history)
+
+    final_mass = float(np.sum(volume_fraction)*dx*dy)
+    mass_error = (
+        (final_mass-initial_mass)/max(initial_mass, 1e-30)
+    )
+
+    summary = f"""
+Rayleigh-Taylor Instability - Numerical Summary
+
+Grid:
+nx = {nx}
+ny = {ny}
+
+Parameters:
+Atwood number = {atwood}
+Gravity = {gravity}
+Kinematic viscosity = {nu}
+Domain length = {length}
+Domain height = {height}
+
+Fluid densities:
+Heavy fluid density = {rho_heavy}
+Light fluid density = {rho_light}
+
+Simulation:
+Completed steps = {completed_steps}
+Final time = {time:.8f}
+
+Volume fraction:
+Initial integral = {initial_mass:.12e}
+Final integral = {final_mass:.12e}
+Relative mass error = {mass_error:.12e}
+Minimum fraction = {np.min(volume_fraction):.8f}
+Maximum fraction = {np.max(volume_fraction):.8f}
+
+Model scope:
+Educational Boussinesq projection flow with conservative
+VOF-style advection. This is not a production geometric
+variable-density VOF solver.
+"""
+
+    (output_dir/"rti_summary.txt").write_text(summary)
+
+    return {
+        "x": x,
+        "y": y,
+        "u": u,
+        "v": v,
+        "p": p,
+        "fraction": volume_fraction,
+        "density": density,
+        "history": np.array(history),
+        "summary": summary,
+        "time": time,
+        "steps": completed_steps,
+        "mass_error": mass_error
+    }
+
+
+# ----------------------- 7. RUN MAIN SIMULATION ------------------
+
+OUT = ROOT/"outputs"
+if OUT.exists():
+    import shutil
+    shutil.rmtree(OUT)
+
+OUT.mkdir(parents=True)
+
+result = run_simulation(
+    nx, ny, Atwood, gravity, nu, t_end,
+    max_steps, poisson_iterations, output_every,
+    OUT
+)
+
+print(result["summary"])
+display(Markdown("### Main simulation completed"))
+
+
+# ----------------------- 8. QUANTITATIVE PLOTS -------------------
+
+history = result["history"]
+
+if len(history) > 0:
+
+    time_values = history[:, 1]
+    spike = history[:, 4]
+    bubble = history[:, 5]
+    mixing_width = history[:, 6]
+    mass_error = history[:, 8]
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(time_values, spike, label="Spike")
+    plt.plot(time_values, bubble, label="Bubble")
+    plt.xlabel("Time")
+    plt.ylabel("Vertical position")
+    plt.title("Spike and Bubble Evolution")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(OUT/"spike_bubble_evolution.png", dpi=200)
+    plt.show()
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(time_values, mixing_width)
+    plt.xlabel("Time")
+    plt.ylabel("Mixing width")
+    plt.title("Mixing-Layer Growth")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(OUT/"mixing_layer_growth.png", dpi=200)
+    plt.show()
+
+    plt.figure(figsize=(8, 4))
+    plt.semilogy(
+        time_values,
+        np.maximum(np.abs(mass_error), 1e-18)
+    )
+    plt.xlabel("Time")
+    plt.ylabel("Absolute relative mass error")
+    plt.title("Volume-Fraction Conservation")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(OUT/"mass_conservation.png", dpi=200)
+    plt.show()
+
+
+# ----------------------- 9. FINAL FIELD VISUALIZATION ------------
+
+plt.figure(figsize=(7, 8))
+
+contour = plt.contourf(
+    result["x"],
+    result["y"],
+    result["fraction"],
+    levels=np.linspace(0, 1, 31),
+    cmap="viridis"
+)
+
+plt.colorbar(contour, label="Heavy-fluid volume fraction")
+plt.xlabel("x")
+plt.ylabel("y")
+plt.title("Final Heavy-Fluid Volume Fraction")
+plt.axis("equal")
+plt.tight_layout()
+plt.savefig(OUT/"final_volume_fraction.png", dpi=200)
+plt.show()
+
+
+plt.figure(figsize=(7, 8))
+
+contour = plt.contourf(
+    result["x"],
+    result["y"],
+    result["density"],
+    levels=30,
+    cmap="viridis"
+)
+
+plt.colorbar(contour, label="Density")
+plt.xlabel("x")
+plt.ylabel("y")
+plt.title("Final Density Distribution")
+plt.axis("equal")
+plt.tight_layout()
+plt.savefig(OUT/"final_density.png", dpi=200)
+plt.show()
+
+
+# ----------------------- 10. COMPULSORY ASSIGNMENT ----------------
+# Compare Atwood numbers 0.2, 0.5 and 0.8
+
+comparison_results = []
+
+if RUN_ATWOOD_COMPARISON:
+
+    print("\nRunning compulsory Atwood-number comparison...")
+
+    for A in [0.2, 0.5, 0.8]:
+
+        comparison_dir = OUT/f"Atwood_{A:.1f}"
+
+        comp = run_simulation(
+            nx, ny, A, gravity, nu, t_end,
+            max_steps, poisson_iterations, output_every,
+            comparison_dir
+        )
+
+        h = comp["history"]
+
+        if len(h) > 0:
+            final = h[-1]
+
+            comparison_results.append([
+                A,
+                final[4],       # Spike position
+                final[5],       # Bubble position
+                final[6],       # Mixing width
+                final[9],       # Minimum fraction
+                final[10],      # Maximum fraction
+                comp["mass_error"],
+                comp["steps"],
+                comp["time"]
+            ])
+
+    comparison_header = [
+        "Atwood",
+        "Spike position",
+        "Bubble position",
+        "Mixing width",
+        "Minimum fraction",
+        "Maximum fraction",
+        "Relative mass error",
+        "Steps",
+        "Final time"
+    ]
+
+    with open(OUT/"atwood_comparison.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(comparison_header)
+        writer.writerows(comparison_results)
+
+    print("\nATWOOD NUMBER COMPARISON")
+    print("-"*100)
+    print(
+        f"{'Atwood':<10}{'Spike':<14}{'Bubble':<14}"
+        f"{'Width':<14}{'Min frac':<14}{'Max frac':<14}"
+        f"{'Mass error':<16}"
+    )
+
+    for row in comparison_results:
+        print(
+            f"{row[0]:<10.1f}{row[1]:<14.5f}{row[2]:<14.5f}"
+            f"{row[3]:<14.5f}{row[4]:<14.5f}{row[5]:<14.5f}"
+            f"{row[6]:<16.3e}"
+        )
+
+    # Comparison plots
+    labels = [f"Atwood {row[0]:.1f}" for row in comparison_results]
+
+    plt.figure(figsize=(8, 4))
+    plt.bar(labels, [row[3] for row in comparison_results])
+    plt.xlabel("Atwood number")
+    plt.ylabel("Mixing width")
+    plt.title("Mixing Width Comparison")
+    plt.grid(axis="y")
+    plt.tight_layout()
+    plt.savefig(OUT/"atwood_mixing_width_comparison.png", dpi=200)
+    plt.show()
+
+    plt.figure(figsize=(8, 4))
+    plt.bar(
+        labels,
+        [abs(row[6]) for row in comparison_results]
+    )
+    plt.xlabel("Atwood number")
+    plt.ylabel("Absolute relative mass error")
+    plt.title("Mass Conservation Comparison")
+    plt.grid(axis="y")
+    plt.tight_layout()
+    plt.savefig(OUT/"atwood_mass_error_comparison.png", dpi=200)
+    plt.show()
+
+
+# ----------------------- 11. GENERATED FILES ---------------------
+
+print("\nGENERATED FILES")
+print("-"*60)
+
+for path in sorted(OUT.rglob("*")):
+    if path.is_file():
+        print(f"{path.relative_to(OUT)}  ({path.stat().st_size/1024:.1f} KB)")
+
+
+# ----------------------- 12. ZIP DOWNLOAD ------------------------
+
+ZIP_PATH = ROOT/"experiment_08_results.zip"
+
+if ZIP_PATH.exists():
+    ZIP_PATH.unlink()
+
+with zipfile.ZipFile(
+    ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED
+) as archive:
+
+    for path in OUT.rglob("*"):
+        if path.is_file():
+            archive.write(path, path.relative_to(OUT))
+
+print("\nResults ZIP created:", ZIP_PATH)
+print(f"ZIP size: {ZIP_PATH.stat().st_size/1024:.1f} KB")
+
+if DOWNLOAD_RESULTS:
+    if IN_COLAB:
+        files.download(str(ZIP_PATH))
+    else:
+        print("ZIP saved locally at:", ZIP_PATH)
+
+print("\nEXPERIMENT 8 COMPLETED.")
