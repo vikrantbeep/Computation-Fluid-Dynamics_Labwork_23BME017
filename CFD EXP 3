@@ -1,0 +1,671 @@
+# ============================================================
+# EXPERIMENT 3: CENTRIFUGAL PUMP - SINGLE ROTATING FRAME (SRF)
+# Complete, self-contained, runnable Python script
+# ============================================================
+
+from pathlib import Path
+import csv
+import math
+import zipfile
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# 1. SELECT RUN MODE AND PARAMETERS
+# ============================================================
+
+RUN_MODE = "quick"  # Options: "quick", "lab", "custom"
+
+# Custom parameters
+nr = 80
+ntheta = 160
+rpm = 2000.0
+Re = 500.0
+T_in = 300.0
+T_wall = 330.0
+iterations = 1200
+swirl = 0.85
+wall_HTC = 120.0
+loss_fraction = 0.04
+
+QUICK_ARGS = [16, 24, 1500, 300, 300, 330, 8, 0.8, 100, 0.04]
+LAB_ARGS = [80, 160, 2000, 500, 300, 330, 1200, 0.85, 120, 0.04]
+CUSTOM_ARGS = [
+    nr, ntheta, rpm, Re, T_in, T_wall,
+    iterations, swirl, wall_HTC, loss_fraction
+]
+
+ARGS = (
+    QUICK_ARGS if RUN_MODE == "quick"
+    else LAB_ARGS if RUN_MODE == "lab"
+    else CUSTOM_ARGS
+)
+
+nr, ntheta, rpm, Re, T_in, T_wall, iterations, swirl, wall_HTC, loss_fraction = ARGS
+
+print("=" * 60)
+print("CENTRIFUGAL PUMP SRF MODEL")
+print("=" * 60)
+print(f"Run mode          : {RUN_MODE}")
+print(f"Radial grid       : {nr}")
+print(f"Angular grid      : {ntheta}")
+print(f"Rotational speed  : {rpm} rpm")
+print(f"Reynolds number   : {Re}")
+print(f"Iterations        : {iterations}")
+print("=" * 60)
+
+# ============================================================
+# 2. OUTPUT DIRECTORY
+# ============================================================
+
+OUTPUT_DIR = Path.cwd() / "centrifugal_pump_results"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ============================================================
+# 3. PHYSICAL PROPERTIES AND GEOMETRY
+# ============================================================
+
+r1 = 0.030
+r2 = 0.120
+depth = 0.010
+
+rho = 997.0
+mu = 0.0010
+cp = 4180.0
+conductivity = 0.60
+gravity = 9.81
+
+omega = rpm * 2.0 * math.pi / 60.0
+hydraulic_diameter = 2.0 * depth
+
+inlet_velocity = Re * mu / (rho * hydraulic_diameter)
+
+r = np.linspace(r1, r2, nr)
+theta = np.linspace(0.0, 2.0 * math.pi, ntheta, endpoint=False)
+
+rr, tt = np.meshgrid(r, theta, indexing="ij")
+
+dr = r[1] - r[0]
+dtheta = theta[1] - theta[0]
+
+# ============================================================
+# 4. VELOCITY FIELD
+# ============================================================
+
+u_r = inlet_velocity * r1 / rr
+
+u_theta_abs = swirl * omega * rr
+u_theta_rel = (swirl - 1.0) * omega * rr
+
+u_abs_x = u_r * np.cos(tt) - u_theta_abs * np.sin(tt)
+u_abs_y = u_r * np.sin(tt) + u_theta_abs * np.cos(tt)
+
+u_rel_x = u_r * np.cos(tt) - u_theta_rel * np.sin(tt)
+u_rel_y = u_r * np.sin(tt) + u_theta_rel * np.cos(tt)
+
+speed_abs = np.sqrt(u_abs_x**2 + u_abs_y**2)
+speed_rel = np.sqrt(u_rel_x**2 + u_rel_y**2)
+
+# ============================================================
+# 5. PRESSURE FIELD
+# ============================================================
+
+pressure = (
+    0.5 * rho * omega**2 * (rr**2 - r1**2)
+    - 12.0 * mu * inlet_velocity * r1
+    * np.log(rr / r1) / depth**2
+)
+
+# ============================================================
+# 6. THERMAL MODEL
+# ============================================================
+
+alpha = conductivity / (rho * cp)
+wall_lambda = wall_HTC * 2.0 / (rho * cp * depth)
+
+loss_heat = (
+    loss_fraction * omega**2 * rr
+    * np.maximum(u_r, 0.0) / cp
+)
+
+temperature = np.full((nr, ntheta), T_in, dtype=float)
+
+history = []
+relax = 0.85
+
+# ============================================================
+# 7. ITERATIVE TEMPERATURE SOLVER
+# ============================================================
+
+print("\nStarting thermal solver...")
+
+for iteration in range(1, iterations + 1):
+
+    old = temperature.copy()
+
+    # Radial neighbours
+    west = np.vstack((
+        np.full((1, ntheta), T_in),
+        old[:-1, :]
+    ))
+
+    east = np.vstack((
+        old[1:, :],
+        old[-1:, :]
+    ))
+
+    # Periodic angular neighbours
+    south = np.roll(old, 1, axis=1)
+    north = np.roll(old, -1, axis=1)
+
+    # Advection coefficients
+    ar = np.abs(u_r) / dr
+
+    at = (
+        np.abs(u_theta_rel)
+        / np.maximum(rr * dtheta, 1e-30)
+    )
+
+    # Diffusion coefficients
+    d_r = alpha / dr**2
+
+    d_t = alpha / np.maximum(
+        rr**2 * dtheta**2, 1e-30
+    )
+
+    # First-order upwind treatment in the angular direction
+    angular_upwind = np.where(
+        u_theta_rel >= 0.0,
+        south,
+        north
+    )
+
+    # Discretized energy equation
+    candidate = (
+        ar * west
+        + at * angular_upwind
+        + d_r * (east + west)
+        + d_t * (north + south)
+        + wall_lambda * T_wall
+        + loss_heat
+    ) / np.maximum(
+        ar + at + 2.0 * d_r + 2.0 * d_t + wall_lambda,
+        1e-30
+    )
+
+    # Under-relaxation
+    temperature = (
+        (1.0 - relax) * old
+        + relax * candidate
+    )
+
+    # Boundary conditions
+    temperature[0, :] = T_in
+    temperature[-1, :] = temperature[-2, :]
+
+    # Numerical bounds
+    lower = min(T_in, T_wall) - 100.0
+    upper = max(T_in, T_wall) + 100.0
+
+    temperature = np.clip(
+        temperature, lower, upper
+    )
+
+    # Convergence residual
+    residual = float(
+        np.max(np.abs(temperature - old))
+    )
+
+    t_out = float(
+        np.mean(temperature[-1, :])
+    )
+
+    history.append([
+        iteration,
+        residual,
+        float(np.min(temperature)),
+        float(np.max(temperature)),
+        t_out
+    ])
+
+    if not np.all(np.isfinite(temperature)):
+        raise FloatingPointError(
+            "Non-finite temperature values detected."
+        )
+
+    # Progress reporting
+    if (
+        iteration == 1
+        or iteration == iterations
+        or iteration % max(1, iterations // 8) == 0
+    ):
+        print(
+            f"Iteration {iteration:5d} | "
+            f"Residual = {residual:.6e} | "
+            f"Outlet temperature = {t_out:.6f} K"
+        )
+
+    if residual < 1e-10 and iteration > 50:
+        print("Convergence criterion reached.")
+        break
+
+print("\nThermal solver completed.")
+
+# ============================================================
+# 8. PUMP PERFORMANCE CALCULATIONS
+# ============================================================
+
+pressure_rise = float(
+    np.mean(pressure[-1, :])
+    - np.mean(pressure[0, :])
+)
+
+pump_head = pressure_rise / (rho * gravity)
+
+outlet_temperature = float(
+    np.mean(temperature[-1, :])
+)
+
+inlet_area = 2.0 * math.pi * r1 * depth
+
+mass_flow = rho * inlet_velocity * inlet_area
+
+heat_gain = (
+    mass_flow * cp
+    * (outlet_temperature - T_in)
+)
+
+# ============================================================
+# 9. PRINT SUMMARY
+# ============================================================
+
+summary = {
+    "Radial grid points": nr,
+    "Angular grid points": ntheta,
+    "Rotational speed (rpm)": rpm,
+    "Angular velocity (rad/s)": omega,
+    "Reynolds number": Re,
+    "Inlet velocity (m/s)": inlet_velocity,
+    "Inlet temperature (K)": T_in,
+    "Wall temperature (K)": T_wall,
+    "Outlet temperature (K)": outlet_temperature,
+    "Pressure rise (Pa)": pressure_rise,
+    "Pump head (m)": pump_head,
+    "Mass flow rate (kg/s)": mass_flow,
+    "Fluid heat gain (W)": heat_gain,
+    "Final residual": history[-1][1],
+}
+
+print("\n" + "=" * 60)
+print("PUMP PERFORMANCE SUMMARY")
+print("=" * 60)
+
+for key, value in summary.items():
+    print(f"{key:<35}: {value:.8g}" if isinstance(value, float)
+          else f"{key:<35}: {value}")
+
+# ============================================================
+# 10. SAVE SUMMARY
+# ============================================================
+
+with (OUTPUT_DIR / "pump_summary.txt").open(
+    "w", encoding="utf-8"
+) as f:
+    f.write(
+        "Simplified 2D annular single-rotating-frame "
+        "centrifugal pump heat-transfer model\n"
+    )
+
+    for key, value in summary.items():
+        f.write(f"{key}: {value}\n")
+
+    f.write(
+        "Model scope: teaching-level reduced-order SRF model\n"
+    )
+
+# ============================================================
+# 11. SAVE CONVERGENCE HISTORY
+# ============================================================
+
+with (OUTPUT_DIR / "pump_history.csv").open(
+    "w", newline="", encoding="utf-8"
+) as f:
+    writer = csv.writer(f)
+
+    writer.writerow([
+        "iteration",
+        "residual_linf",
+        "minimum_temperature",
+        "maximum_temperature",
+        "outlet_temperature"
+    ])
+
+    writer.writerows(history)
+
+# ============================================================
+# 12. WRITE STRUCTURED-GRID VTK FILE
+# ============================================================
+
+def write_structured_grid_vtk(
+    path, x, y, scalars, vectors, title
+):
+    ny, nx = x.shape
+
+    with open(path, "w", encoding="utf-8") as f:
+
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write(f"{title}\n")
+        f.write("ASCII\n")
+        f.write("DATASET STRUCTURED_GRID\n")
+        f.write(f"DIMENSIONS {nx} {ny} 1\n")
+        f.write(f"POINTS {nx * ny} float\n")
+
+        for j in range(ny):
+            for i in range(nx):
+                f.write(
+                    f"{x[j, i]:.12e} "
+                    f"{y[j, i]:.12e} 0\n"
+                )
+
+        f.write(f"POINT_DATA {nx * ny}\n")
+
+        for name, values in scalars.items():
+            f.write(f"SCALARS {name} float 1\n")
+            f.write("LOOKUP_TABLE default\n")
+
+            for value in values.ravel(order="C"):
+                f.write(f"{value:.12e}\n")
+
+        for name, (vx, vy) in vectors.items():
+            f.write(f"VECTORS {name} float\n")
+
+            for ax, ay in zip(
+                vx.ravel(order="C"),
+                vy.ravel(order="C")
+            ):
+                f.write(
+                    f"{ax:.12e} {ay:.12e} 0\n"
+                )
+
+
+x = rr * np.cos(tt)
+y = rr * np.sin(tt)
+
+write_structured_grid_vtk(
+    OUTPUT_DIR / "pump_annulus_srf.vtk",
+    x,
+    y,
+    {
+        "temperature": temperature,
+        "pressure": pressure,
+        "absolute_speed": speed_abs,
+        "relative_speed": speed_rel,
+        "radius": rr
+    },
+    {
+        "absolute_velocity": (u_abs_x, u_abs_y),
+        "relative_velocity": (u_rel_x, u_rel_y)
+    },
+    "Centrifugal pump annular SRF model"
+)
+
+# ============================================================
+# 13. PLOT TEMPERATURE CONTOURS
+# ============================================================
+
+plt.figure(figsize=(8, 6))
+
+contour = plt.contourf(
+    x, y, temperature,
+    levels=30,
+    cmap="inferno"
+)
+
+plt.colorbar(
+    contour,
+    label="Temperature (K)"
+)
+
+plt.xlabel("x (m)")
+plt.ylabel("y (m)")
+plt.title("Centrifugal Pump Temperature Distribution")
+plt.axis("equal")
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "temperature_distribution.png",
+    dpi=300
+)
+
+plt.show()
+
+# ============================================================
+# 14. PLOT PRESSURE DISTRIBUTION
+# ============================================================
+
+plt.figure(figsize=(8, 6))
+
+contour = plt.contourf(
+    x, y, pressure,
+    levels=30,
+    cmap="viridis"
+)
+
+plt.colorbar(
+    contour,
+    label="Pressure (Pa)"
+)
+
+plt.xlabel("x (m)")
+plt.ylabel("y (m)")
+plt.title("Centrifugal Pump Pressure Distribution")
+plt.axis("equal")
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "pressure_distribution.png",
+    dpi=300
+)
+
+plt.show()
+
+# ============================================================
+# 15. PLOT CONVERGENCE
+# ============================================================
+
+history_array = np.asarray(history)
+
+plt.figure(figsize=(8, 5))
+
+plt.semilogy(
+    history_array[:, 0],
+    np.maximum(history_array[:, 1], 1e-30)
+)
+
+plt.xlabel("Iteration")
+plt.ylabel("L-infinity residual")
+plt.title("Thermal Solver Convergence")
+plt.grid(True)
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "thermal_convergence.png",
+    dpi=300
+)
+
+plt.show()
+
+# ============================================================
+# 16. PLOT OUTLET TEMPERATURE CONVERGENCE
+# ============================================================
+
+plt.figure(figsize=(8, 5))
+
+plt.plot(
+    history_array[:, 0],
+    history_array[:, 4]
+)
+
+plt.xlabel("Iteration")
+plt.ylabel("Outlet temperature (K)")
+plt.title("Outlet Temperature Convergence")
+plt.grid(True)
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "outlet_temperature_convergence.png",
+    dpi=300
+)
+
+plt.show()
+
+# ============================================================
+# 17. SAVE ANNULAR BOUNDARIES AND BLADE GUIDES
+# ============================================================
+
+def write_multiline_vtk(path, lines, title):
+    points = []
+    connectivity = []
+
+    for line_x, line_y in lines:
+        line_x = np.asarray(line_x).ravel()
+        line_y = np.asarray(line_y).ravel()
+
+        ids = list(
+            range(len(points), len(points) + len(line_x))
+        )
+
+        points.extend(zip(line_x.tolist(), line_y.tolist()))
+        connectivity.append(ids)
+
+    total_size = sum(
+        len(ids) + 1 for ids in connectivity
+    )
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write(f"{title}\n")
+        f.write("ASCII\n")
+        f.write("DATASET POLYDATA\n")
+        f.write(f"POINTS {len(points)} float\n")
+
+        for px, py in points:
+            f.write(f"{px:.12e} {py:.12e} 0\n")
+
+        f.write(
+            f"LINES {len(connectivity)} {total_size}\n"
+        )
+
+        for ids in connectivity:
+            f.write(
+                f"{len(ids)} "
+                + " ".join(str(i) for i in ids)
+                + "\n"
+            )
+
+
+circle_theta = np.linspace(
+    0.0, 2.0 * math.pi, 361
+)
+
+radial = np.linspace(r1, r2, 60)
+
+boundary_lines = [
+    (
+        r1 * np.cos(circle_theta),
+        r1 * np.sin(circle_theta)
+    ),
+    (
+        r2 * np.cos(circle_theta),
+        r2 * np.sin(circle_theta)
+    )
+]
+
+write_multiline_vtk(
+    OUTPUT_DIR / "pump_boundaries.vtk",
+    boundary_lines,
+    "Pump annular boundaries"
+)
+
+flow_guides = []
+
+for angle in np.linspace(
+    0.0, 2.0 * math.pi, 13
+)[:-1]:
+
+    flow_guides.append((
+        radial * np.cos(angle),
+        radial * np.sin(angle)
+    ))
+
+write_multiline_vtk(
+    OUTPUT_DIR / "pump_flow_path_guides.vtk",
+    flow_guides,
+    "Pump radial flow guides"
+)
+
+blade_guides = []
+
+for angle in np.linspace(
+    0.0, 2.0 * math.pi, 9
+)[:-1]:
+
+    blade_angle = (
+        angle
+        + 0.75 * (radial - r1) / (r2 - r1)
+    )
+
+    blade_guides.append((
+        radial * np.cos(blade_angle),
+        radial * np.sin(blade_angle)
+    ))
+
+write_multiline_vtk(
+    OUTPUT_DIR / "pump_blade_guides.vtk",
+    blade_guides,
+    "Pump blade guides"
+)
+
+# ============================================================
+# 18. PACKAGE RESULTS INTO A ZIP ARCHIVE
+# ============================================================
+
+archive_path = (
+    OUTPUT_DIR.parent / "centrifugal_pump_results.zip"
+)
+
+with zipfile.ZipFile(
+    archive_path,
+    "w",
+    compression=zipfile.ZIP_DEFLATED
+) as archive:
+
+    for path in sorted(OUTPUT_DIR.rglob("*")):
+        if path.is_file():
+            archive.write(
+                path,
+                path.relative_to(OUTPUT_DIR)
+            )
+
+print("\n" + "=" * 60)
+print("SIMULATION COMPLETED")
+print("=" * 60)
+
+print(f"Results folder: {OUTPUT_DIR}")
+print(f"ZIP archive   : {archive_path}")
+
+print("\nGenerated files:")
+
+for path in sorted(OUTPUT_DIR.iterdir()):
+    if path.is_file():
+        print(f"  {path.name}")
+
+# Automatically download results when running in Google Colab.
+try:
+    from google.colab import files
+    files.download(str(archive_path))
+except ImportError:
+    print(
+        "\nRunning locally. Open the results folder "
+        "to access your generated files."
+    )
