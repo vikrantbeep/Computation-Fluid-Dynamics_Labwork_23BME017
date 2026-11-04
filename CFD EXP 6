@@ -1,0 +1,1047 @@
+
+# ================================================================
+# EXPERIMENT 6: TWO-DIMENSIONAL PLATE CONDUCTION
+# JACOBI METHOD vs LINE-TDMA / SOR METHOD
+# COMPLETE SELF-CONTAINED GOOGLE COLAB CODE
+# ================================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+import csv
+import zipfile
+import math
+from pathlib import Path
+
+from google.colab import files
+
+# ================================================================
+# 1. SIMULATION PARAMETERS
+# ================================================================
+
+RUN_MODE = "lab"
+
+# LAB PARAMETERS
+NX = 81
+NY = 61
+
+L = 1.0
+H = 1.0
+
+T_LEFT = 100.0
+
+MAX_ITERATIONS = 10000
+TOLERANCE = 1e-8
+
+OMEGA = 1.55
+SCREEN_EVERY = 1000
+
+if RUN_MODE == "quick":
+    NX = 21
+    NY = 21
+    MAX_ITERATIONS = 30
+    TOLERANCE = 1e-5
+    OMEGA = 1.3
+    SCREEN_EVERY = 10
+
+OUTPUT_DIR = Path("/content/cfd_lab_exp06")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+print("=" * 65)
+print("EXPERIMENT 6: TWO-DIMENSIONAL PLATE CONDUCTION")
+print("=" * 65)
+
+print(f"Grid size              : {NX} x {NY}")
+print(f"Plate length           : {L}")
+print(f"Plate height           : {H}")
+print(f"Left boundary temp.    : {T_LEFT}")
+print(f"Maximum iterations     : {MAX_ITERATIONS}")
+print(f"Convergence tolerance  : {TOLERANCE}")
+print(f"SOR relaxation factor  : {OMEGA}")
+
+# ================================================================
+# 2. COMPUTATIONAL GRID
+# ================================================================
+
+x1 = np.linspace(0.0, L, NX)
+y1 = np.linspace(0.0, H, NY)
+
+X, Y = np.meshgrid(x1, y1)
+
+DX = x1[1] - x1[0]
+DY = y1[1] - y1[0]
+
+BETA = (DX / DY)**2
+
+print(f"\nDX = {DX:.6e}")
+print(f"DY = {DY:.6e}")
+print(f"Beta = {BETA:.6e}")
+
+# ================================================================
+# 3. ANALYTICAL SOLUTION
+# ================================================================
+
+def analytical_solution(x, y):
+
+    denominator = math.sinh(math.pi * L / H)
+
+    return (
+        T_LEFT
+        * np.sinh(math.pi * (L - x) / H)
+        * np.sin(math.pi * y / H)
+        / denominator
+    )
+
+
+T_ANALYTICAL = analytical_solution(X, Y)
+
+# ================================================================
+# 4. BOUNDARY CONDITIONS
+# ================================================================
+
+def apply_boundaries(T):
+
+    # Left boundary
+    T[:, 0] = T_LEFT * np.sin(math.pi * y1 / H)
+
+    # Right boundary
+    T[:, -1] = 0.0
+
+    # Bottom boundary
+    T[0, :] = 0.0
+
+    # Top boundary
+    T[-1, :] = 0.0
+
+
+# ================================================================
+# 5. TDMA SOLVER
+# ================================================================
+
+def tdma(a, b, c, d):
+
+    a = np.asarray(a, dtype=float).copy()
+    b = np.asarray(b, dtype=float).copy()
+    c = np.asarray(c, dtype=float).copy()
+    d = np.asarray(d, dtype=float).copy()
+
+    n = len(d)
+
+    if n == 0:
+        raise ValueError("TDMA system is empty")
+
+    # Forward elimination
+
+    for i in range(1, n):
+
+        if abs(b[i-1]) < 1e-30:
+            raise FloatingPointError("Zero TDMA pivot")
+
+        factor = a[i] / b[i-1]
+
+        b[i] -= factor * c[i-1]
+        d[i] -= factor * d[i-1]
+
+    # Back substitution
+
+    solution = np.zeros(n)
+
+    if abs(b[-1]) < 1e-30:
+        raise FloatingPointError("Zero TDMA pivot")
+
+    solution[-1] = d[-1] / b[-1]
+
+    for i in range(n-2, -1, -1):
+
+        if abs(b[i]) < 1e-30:
+            raise FloatingPointError("Zero TDMA pivot")
+
+        solution[i] = (
+            d[i] - c[i] * solution[i+1]
+        ) / b[i]
+
+    return solution
+
+
+# ================================================================
+# 6. RELATIVE L2 ERROR
+# ================================================================
+
+def relative_l2(numerical, reference):
+
+    numerator = np.linalg.norm(
+        (numerical - reference).ravel()
+    )
+
+    denominator = np.linalg.norm(
+        reference.ravel()
+    )
+
+    return numerator / max(denominator, 1e-30)
+
+
+# ================================================================
+# 7. INITIALIZE JACOBI AND LINE-TDMA SOLUTIONS
+# ================================================================
+
+T_JACOBI = np.zeros((NY, NX))
+
+T_LINE_TDMA = np.zeros((NY, NX))
+
+apply_boundaries(T_JACOBI)
+apply_boundaries(T_LINE_TDMA)
+
+JACOBI_HISTORY = []
+TDMA_HISTORY = []
+
+# ================================================================
+# 8. JACOBI ITERATIVE METHOD
+# ================================================================
+
+print("\n" + "=" * 65)
+print("STARTING JACOBI METHOD")
+print("=" * 65)
+
+JACOBI_ITERATIONS = MAX_ITERATIONS
+JACOBI_RESIDUAL = float("inf")
+
+for iteration in range(1, MAX_ITERATIONS + 1):
+
+    OLD = T_JACOBI.copy()
+
+    # Finite difference Laplace equation
+
+    T_JACOBI[1:-1, 1:-1] = (
+
+        OLD[1:-1, 2:]
+        + OLD[1:-1, :-2]
+
+        + BETA * (
+            OLD[2:, 1:-1]
+            + OLD[:-2, 1:-1]
+        )
+
+    ) / (2.0 * (1.0 + BETA))
+
+    # Reapply boundary conditions
+
+    apply_boundaries(T_JACOBI)
+
+    # Residual: maximum change between iterations
+
+    JACOBI_RESIDUAL = np.max(
+        np.abs(T_JACOBI - OLD)
+    )
+
+    ERROR = relative_l2(
+        T_JACOBI,
+        T_ANALYTICAL
+    )
+
+    JACOBI_HISTORY.append([
+        iteration,
+        JACOBI_RESIDUAL,
+        ERROR
+    ])
+
+    if (
+        iteration == 1
+        or iteration == MAX_ITERATIONS
+        or iteration % SCREEN_EVERY == 0
+    ):
+
+        print(
+            f"Jacobi Iteration: {iteration:6d} | "
+            f"Residual: {JACOBI_RESIDUAL:.6e} | "
+            f"L2 Error: {ERROR:.6e}"
+        )
+
+    if JACOBI_RESIDUAL < TOLERANCE:
+
+        JACOBI_ITERATIONS = iteration
+        break
+
+
+# ================================================================
+# 9. LINE-TDMA / SOR METHOD
+# ================================================================
+
+print("\n" + "=" * 65)
+print("STARTING LINE-TDMA / SOR METHOD")
+print("=" * 65)
+
+TDMA_ITERATIONS = MAX_ITERATIONS
+TDMA_RESIDUAL = float("inf")
+
+N_UNKNOWN = NX - 2
+
+for iteration in range(1, MAX_ITERATIONS + 1):
+
+    OLD_ITERATION = T_LINE_TDMA.copy()
+
+    # Sweep along horizontal lines
+
+    for j in range(1, NY - 1):
+
+        a = np.full(
+            N_UNKNOWN,
+            -1.0
+        )
+
+        b = np.full(
+            N_UNKNOWN,
+            2.0 * (1.0 + BETA)
+        )
+
+        c = np.full(
+            N_UNKNOWN,
+            -1.0
+        )
+
+        # Right-hand side
+
+        rhs = BETA * (
+            T_LINE_TDMA[j+1, 1:-1]
+            + T_LINE_TDMA[j-1, 1:-1]
+        )
+
+        rhs[0] += T_LINE_TDMA[j, 0]
+
+        rhs[-1] += T_LINE_TDMA[j, -1]
+
+        a[0] = 0.0
+        c[-1] = 0.0
+
+        # Solve using TDMA
+
+        SOLVED = tdma(
+            a, b, c, rhs
+        )
+
+        # SOR relaxation
+
+        T_LINE_TDMA[j, 1:-1] = (
+
+            (1.0 - OMEGA)
+            * T_LINE_TDMA[j, 1:-1]
+
+            + OMEGA * SOLVED
+
+        )
+
+    apply_boundaries(T_LINE_TDMA)
+
+    TDMA_RESIDUAL = np.max(
+        np.abs(
+            T_LINE_TDMA - OLD_ITERATION
+        )
+    )
+
+    ERROR = relative_l2(
+        T_LINE_TDMA,
+        T_ANALYTICAL
+    )
+
+    TDMA_HISTORY.append([
+        iteration,
+        TDMA_RESIDUAL,
+        ERROR
+    ])
+
+    if (
+        iteration == 1
+        or iteration == MAX_ITERATIONS
+        or iteration % SCREEN_EVERY == 0
+    ):
+
+        print(
+            f"Line-TDMA Iteration: {iteration:6d} | "
+            f"Residual: {TDMA_RESIDUAL:.6e} | "
+            f"L2 Error: {ERROR:.6e}"
+        )
+
+    if TDMA_RESIDUAL < TOLERANCE:
+
+        TDMA_ITERATIONS = iteration
+        break
+
+
+# ================================================================
+# 10. CALCULATE FINAL ERRORS
+# ================================================================
+
+JACOBI_ERROR = relative_l2(
+    T_JACOBI,
+    T_ANALYTICAL
+)
+
+TDMA_ERROR = relative_l2(
+    T_LINE_TDMA,
+    T_ANALYTICAL
+)
+
+JACOBI_MAX_ERROR = np.max(
+    np.abs(T_JACOBI - T_ANALYTICAL)
+)
+
+TDMA_MAX_ERROR = np.max(
+    np.abs(T_LINE_TDMA - T_ANALYTICAL)
+)
+
+print("\n" + "=" * 65)
+print("FINAL NUMERICAL RESULTS")
+print("=" * 65)
+
+print(
+    f"Jacobi iterations       : {JACOBI_ITERATIONS}"
+)
+
+print(
+    f"Jacobi residual         : {JACOBI_RESIDUAL:.8e}"
+)
+
+print(
+    f"Jacobi relative L2 error: {JACOBI_ERROR:.8e}"
+)
+
+print(
+    f"Line-TDMA iterations    : {TDMA_ITERATIONS}"
+)
+
+print(
+    f"Line-TDMA residual      : {TDMA_RESIDUAL:.8e}"
+)
+
+print(
+    f"Line-TDMA relative L2   : {TDMA_ERROR:.8e}"
+)
+
+# ================================================================
+# 11. SAVE VTK STRUCTURED GRID
+# ================================================================
+
+def write_structured_grid_vtk(
+    filename,
+    x,
+    y,
+    scalars
+):
+
+    ny, nx = x.shape
+
+    with open(filename, "w") as handle:
+
+        handle.write("# vtk DataFile Version 3.0\n")
+        handle.write("2D Plate Conduction\n")
+        handle.write("ASCII\n")
+        handle.write("DATASET STRUCTURED_GRID\n")
+
+        handle.write(
+            f"DIMENSIONS {nx} {ny} 1\n"
+        )
+
+        handle.write(
+            f"POINTS {nx * ny} float\n"
+        )
+
+        for j in range(ny):
+
+            for i in range(nx):
+
+                handle.write(
+                    f"{x[j,i]:.12e} "
+                    f"{y[j,i]:.12e} 0\n"
+                )
+
+        handle.write(
+            f"POINT_DATA {nx * ny}\n"
+        )
+
+        for name, field in scalars.items():
+
+            handle.write(
+                f"SCALARS {name} float 1\n"
+            )
+
+            handle.write(
+                "LOOKUP_TABLE default\n"
+            )
+
+            for value in field.ravel():
+
+                handle.write(
+                    f"{value:.12e}\n"
+                )
+
+
+VTK_FILE = OUTPUT_DIR / "plate_conduction_2d.vtk"
+
+write_structured_grid_vtk(
+    VTK_FILE,
+    X,
+    Y,
+    {
+        "temperature_jacobi": T_JACOBI,
+        "temperature_line_tdma": T_LINE_TDMA,
+        "temperature_analytical": T_ANALYTICAL,
+        "jacobi_absolute_error": np.abs(
+            T_JACOBI - T_ANALYTICAL
+        ),
+        "line_tdma_absolute_error": np.abs(
+            T_LINE_TDMA - T_ANALYTICAL
+        )
+    }
+)
+
+# ================================================================
+# 12. SAVE BOUNDARY GEOMETRY
+# ================================================================
+
+BOUNDARY_FILE = OUTPUT_DIR / "plate_boundaries.csv"
+
+with open(BOUNDARY_FILE, "w", newline="") as handle:
+
+    writer = csv.writer(handle)
+
+    writer.writerow(["x", "y"])
+
+    boundaries = [
+        (0.0, 0.0),
+        (L, 0.0),
+        (L, H),
+        (0.0, H),
+        (0.0, 0.0)
+    ]
+
+    writer.writerows(boundaries)
+
+# ================================================================
+# 13. SAVE CENTRELINE PROFILES
+# ================================================================
+
+CENTER_J = NY // 2
+CENTER_I = NX // 2
+
+PROFILE_FILE = OUTPUT_DIR / "plate_conduction_profiles.csv"
+
+with open(PROFILE_FILE, "w", newline="") as handle:
+
+    writer = csv.writer(handle)
+
+    writer.writerow([
+        "coordinate",
+        "horizontal_jacobi",
+        "horizontal_line_tdma",
+        "horizontal_analytical",
+        "vertical_jacobi",
+        "vertical_line_tdma",
+        "vertical_analytical"
+    ])
+
+    NROWS = max(NX, NY)
+
+    for k in range(NROWS):
+
+        coordinate = k / max(NROWS - 1, 1)
+
+        ih = min(
+            int(round(coordinate * (NX - 1))),
+            NX - 1
+        )
+
+        jv = min(
+            int(round(coordinate * (NY - 1))),
+            NY - 1
+        )
+
+        writer.writerow([
+            coordinate,
+
+            T_JACOBI[CENTER_J, ih],
+            T_LINE_TDMA[CENTER_J, ih],
+            T_ANALYTICAL[CENTER_J, ih],
+
+            T_JACOBI[jv, CENTER_I],
+            T_LINE_TDMA[jv, CENTER_I],
+            T_ANALYTICAL[jv, CENTER_I]
+        ])
+
+# ================================================================
+# 14. SAVE CONVERGENCE HISTORY
+# ================================================================
+
+HISTORY_FILE = OUTPUT_DIR / "plate_conduction_history.csv"
+
+with open(HISTORY_FILE, "w", newline="") as handle:
+
+    writer = csv.writer(handle)
+
+    writer.writerow([
+        "method",
+        "iteration",
+        "residual_linf",
+        "relative_l2_error"
+    ])
+
+    for row in JACOBI_HISTORY:
+
+        writer.writerow([
+            "jacobi",
+            *row
+        ])
+
+    for row in TDMA_HISTORY:
+
+        writer.writerow([
+            "line_tdma",
+            *row
+        ])
+
+# ================================================================
+# 15. SAVE SUMMARY
+# ================================================================
+
+SUMMARY_FILE = OUTPUT_DIR / "plate_conduction_summary.txt"
+
+with open(SUMMARY_FILE, "w") as handle:
+
+    handle.write(
+        "STEADY 2D LAPLACE HEAT CONDUCTION\n"
+    )
+
+    handle.write(f"nx {NX}\n")
+    handle.write(f"ny {NY}\n")
+    handle.write(f"L {L}\n")
+    handle.write(f"H {H}\n")
+    handle.write(f"Tleft {T_LEFT}\n")
+    handle.write(f"omega {OMEGA}\n")
+    handle.write(f"tolerance {TOLERANCE}\n")
+
+    handle.write(
+        f"jacobi_iterations {JACOBI_ITERATIONS}\n"
+    )
+
+    handle.write(
+        f"jacobi_final_residual {JACOBI_RESIDUAL:.12e}\n"
+    )
+
+    handle.write(
+        f"jacobi_relative_L2_error {JACOBI_ERROR:.12e}\n"
+    )
+
+    handle.write(
+        f"jacobi_maximum_error {JACOBI_MAX_ERROR:.12e}\n"
+    )
+
+    handle.write(
+        f"line_tdma_iterations {TDMA_ITERATIONS}\n"
+    )
+
+    handle.write(
+        f"line_tdma_final_residual {TDMA_RESIDUAL:.12e}\n"
+    )
+
+    handle.write(
+        f"line_tdma_relative_L2_error {TDMA_ERROR:.12e}\n"
+    )
+
+    handle.write(
+        f"line_tdma_maximum_error {TDMA_MAX_ERROR:.12e}\n"
+    )
+
+# ================================================================
+# 16. HORIZONTAL CENTRELINE PLOT
+# ================================================================
+
+plt.figure(figsize=(8, 5))
+
+plt.plot(
+    x1,
+    T_JACOBI[CENTER_J, :],
+    label="Jacobi",
+    linewidth=2
+)
+
+plt.plot(
+    x1,
+    T_LINE_TDMA[CENTER_J, :],
+    label="Line TDMA",
+    linewidth=2
+)
+
+plt.plot(
+    x1,
+    T_ANALYTICAL[CENTER_J, :],
+    "--",
+    label="Analytical",
+    linewidth=2
+)
+
+plt.xlabel("Normalized horizontal coordinate")
+plt.ylabel("Temperature")
+
+plt.title(
+    "Horizontal Centreline Temperature Distribution"
+)
+
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "horizontal_centreline.png",
+    dpi=300
+)
+
+plt.show()
+
+# ================================================================
+# 17. VERTICAL CENTRELINE PLOT
+# ================================================================
+
+plt.figure(figsize=(8, 5))
+
+plt.plot(
+    y1,
+    T_JACOBI[:, CENTER_I],
+    label="Jacobi",
+    linewidth=2
+)
+
+plt.plot(
+    y1,
+    T_LINE_TDMA[:, CENTER_I],
+    label="Line TDMA",
+    linewidth=2
+)
+
+plt.plot(
+    y1,
+    T_ANALYTICAL[:, CENTER_I],
+    "--",
+    label="Analytical",
+    linewidth=2
+)
+
+plt.xlabel("Normalized vertical coordinate")
+plt.ylabel("Temperature")
+
+plt.title(
+    "Vertical Centreline Temperature Distribution"
+)
+
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "vertical_centreline.png",
+    dpi=300
+)
+
+plt.show()
+
+# ================================================================
+# 18. TEMPERATURE CONTOUR: JACOBI
+# ================================================================
+
+plt.figure(figsize=(9, 6))
+
+contour = plt.contourf(
+    X,
+    Y,
+    T_JACOBI,
+    levels=30,
+    cmap="inferno"
+)
+
+plt.colorbar(
+    contour,
+    label="Temperature"
+)
+
+plt.xlabel("x")
+plt.ylabel("y")
+
+plt.title(
+    "2D Plate Temperature Distribution - Jacobi"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "temperature_jacobi.png",
+    dpi=300
+)
+
+plt.show()
+
+# ================================================================
+# 19. TEMPERATURE CONTOUR: LINE-TDMA
+# ================================================================
+
+plt.figure(figsize=(9, 6))
+
+contour = plt.contourf(
+    X,
+    Y,
+    T_LINE_TDMA,
+    levels=30,
+    cmap="inferno"
+)
+
+plt.colorbar(
+    contour,
+    label="Temperature"
+)
+
+plt.xlabel("x")
+plt.ylabel("y")
+
+plt.title(
+    "2D Plate Temperature Distribution - Line TDMA"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "temperature_line_tdma.png",
+    dpi=300
+)
+
+plt.show()
+
+# ================================================================
+# 20. ANALYTICAL TEMPERATURE CONTOUR
+# ================================================================
+
+plt.figure(figsize=(9, 6))
+
+contour = plt.contourf(
+    X,
+    Y,
+    T_ANALYTICAL,
+    levels=30,
+    cmap="inferno"
+)
+
+plt.colorbar(
+    contour,
+    label="Temperature"
+)
+
+plt.xlabel("x")
+plt.ylabel("y")
+
+plt.title(
+    "2D Plate Analytical Temperature Distribution"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "temperature_analytical.png",
+    dpi=300
+)
+
+plt.show()
+
+# ================================================================
+# 21. RESIDUAL CONVERGENCE PLOT
+# ================================================================
+
+plt.figure(figsize=(9, 5))
+
+JH = np.array(JACOBI_HISTORY)
+
+TH = np.array(TDMA_HISTORY)
+
+plt.semilogy(
+    JH[:, 0],
+    JH[:, 1],
+    label="Jacobi",
+    linewidth=2
+)
+
+plt.semilogy(
+    TH[:, 0],
+    TH[:, 1],
+    label="Line TDMA / SOR",
+    linewidth=2
+)
+
+plt.xlabel("Iteration")
+plt.ylabel("Residual (L-infinity)")
+
+plt.title(
+    "Convergence History"
+)
+
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "convergence_history.png",
+    dpi=300
+)
+
+plt.show()
+
+# ================================================================
+# 22. RELATIVE L2 ERROR PLOT
+# ================================================================
+
+plt.figure(figsize=(9, 5))
+
+plt.semilogy(
+    JH[:, 0],
+    JH[:, 2],
+    label="Jacobi",
+    linewidth=2
+)
+
+plt.semilogy(
+    TH[:, 0],
+    TH[:, 2],
+    label="Line TDMA / SOR",
+    linewidth=2
+)
+
+plt.xlabel("Iteration")
+plt.ylabel("Relative L2 Error")
+
+plt.title(
+    "Analytical Error History"
+)
+
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "error_history.png",
+    dpi=300
+)
+
+plt.show()
+
+# ================================================================
+# 23. ABSOLUTE ERROR CONTOURS
+# ================================================================
+
+FIG, AXES = plt.subplots(
+    1, 2,
+    figsize=(13, 5)
+)
+
+C1 = AXES[0].contourf(
+    X,
+    Y,
+    np.abs(T_JACOBI - T_ANALYTICAL),
+    levels=30
+)
+
+AXES[0].set_title("Jacobi Absolute Error")
+AXES[0].set_xlabel("x")
+AXES[0].set_ylabel("y")
+
+FIG.colorbar(C1, ax=AXES[0])
+
+C2 = AXES[1].contourf(
+    X,
+    Y,
+    np.abs(T_LINE_TDMA - T_ANALYTICAL),
+    levels=30
+)
+
+AXES[1].set_title("Line-TDMA Absolute Error")
+AXES[1].set_xlabel("x")
+AXES[1].set_ylabel("y")
+
+FIG.colorbar(C2, ax=AXES[1])
+
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_DIR / "absolute_error_comparison.png",
+    dpi=300
+)
+
+plt.show()
+
+# ================================================================
+# 24. FINAL RESULTS TABLE
+# ================================================================
+
+print("\n" + "=" * 75)
+print("METHOD COMPARISON")
+print("=" * 75)
+
+print(
+    f"{'Method':<22}"
+    f"{'Iterations':<15}"
+    f"{'Residual':<20}"
+    f"{'Relative L2 Error':<20}"
+)
+
+print("-" * 75)
+
+print(
+    f"{'Jacobi':<22}"
+    f"{JACOBI_ITERATIONS:<15}"
+    f"{JACOBI_RESIDUAL:<20.6e}"
+    f"{JACOBI_ERROR:<20.6e}"
+)
+
+print(
+    f"{'Line TDMA / SOR':<22}"
+    f"{TDMA_ITERATIONS:<15}"
+    f"{TDMA_RESIDUAL:<20.6e}"
+    f"{TDMA_ERROR:<20.6e}"
+)
+
+print("=" * 75)
+
+# ================================================================
+# 25. ZIP ALL RESULTS
+# ================================================================
+
+ZIP_FILE = Path(
+    "/content/experiment_06_results.zip"
+)
+
+with zipfile.ZipFile(
+    ZIP_FILE,
+    "w",
+    zipfile.ZIP_DEFLATED
+) as ZIP:
+
+    for FILE in sorted(OUTPUT_DIR.iterdir()):
+
+        if FILE.is_file():
+
+            ZIP.write(
+                FILE,
+                FILE.name
+            )
+
+print("\nGenerated output files:")
+
+for FILE in sorted(OUTPUT_DIR.iterdir()):
+
+    print(
+        f"{FILE.name:<40}"
+        f"{FILE.stat().st_size / 1024:.2f} KB"
+    )
+
+# ================================================================
+# 26. DOWNLOAD RESULTS
+# ================================================================
+
+print("\nPreparing results download...")
+
+files.download(
+    str(ZIP_FILE)
+)
+
+print("\nEXPERIMENT 6 COMPLETED SUCCESSFULLY.")
