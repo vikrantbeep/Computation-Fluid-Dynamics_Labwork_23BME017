@@ -1,0 +1,1223 @@
+
+# EXPERIMENT 11: GENERIC CONVECTION-DIFFUSION TRANSPORT
+
+
+import os
+import csv
+import zipfile
+import shutil
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+try:
+    from google.colab import files
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+
+# ================================================================
+# 1. PARAMETERS
+# ================================================================
+
+RUN_MODE = "lab"       # "quick", "lab", "custom"
+
+# Custom parameters
+mode = "all"
+nx = 121
+ny = 61
+Pe = 200.0
+iterations = 3000
+output_every = 300
+
+# Compulsory assignment comparison
+RUN_PECLET_COMPARISON = True
+
+# Automatic ZIP download
+DOWNLOAD_RESULTS = True
+
+QUICK_ARGS = ["all", 25, 21, 100, 8, 8]
+LAB_ARGS = ["all", 121, 61, 200, 3000, 300]
+CUSTOM_ARGS = [mode, nx, ny, Pe, iterations, output_every]
+
+if RUN_MODE == "quick":
+    ARGS = QUICK_ARGS
+elif RUN_MODE == "lab":
+    ARGS = LAB_ARGS
+else:
+    ARGS = CUSTOM_ARGS
+
+mode, nx, ny, Pe, iterations, output_every = ARGS
+
+print("Experiment 11: Convection-Diffusion Transport")
+print("Run mode:", RUN_MODE)
+print("Parameters:", ARGS)
+
+
+# ================================================================
+# 2. OUTPUT DIRECTORIES
+# ================================================================
+
+ROOT = (
+    Path("/content/cfd_lab_exp11")
+    if IN_COLAB else Path.cwd() / "cfd_lab_exp11"
+)
+
+if ROOT.exists():
+    shutil.rmtree(ROOT)
+
+ROOT.mkdir(parents=True, exist_ok=True)
+
+OUT = ROOT / "outputs"
+OUT.mkdir(parents=True, exist_ok=True)
+
+
+# ================================================================
+# 3. NUMERICAL UTILITIES
+# ================================================================
+
+def laplacian(field, dx, dy):
+
+    out = np.zeros_like(field)
+
+    out[1:-1, 1:-1] = (
+        (
+            field[1:-1, 2:]
+            - 2.0 * field[1:-1, 1:-1]
+            + field[1:-1, :-2]
+        ) / (dx * dx)
+        +
+        (
+            field[2:, 1:-1]
+            - 2.0 * field[1:-1, 1:-1]
+            + field[:-2, 1:-1]
+        ) / (dy * dy)
+    )
+
+    return out
+
+
+def upwind_derivative_x(field, velocity, dx):
+
+    out = np.zeros_like(field)
+
+    backward = (
+        field[1:-1, 1:-1]
+        - field[1:-1, :-2]
+    ) / dx
+
+    forward = (
+        field[1:-1, 2:]
+        - field[1:-1, 1:-1]
+    ) / dx
+
+    out[1:-1, 1:-1] = np.where(
+        velocity[1:-1, 1:-1] >= 0.0,
+        backward,
+        forward
+    )
+
+    return out
+
+
+def upwind_derivative_y(field, velocity, dy):
+
+    out = np.zeros_like(field)
+
+    backward = (
+        field[1:-1, 1:-1]
+        - field[:-2, 1:-1]
+    ) / dy
+
+    forward = (
+        field[2:, 1:-1]
+        - field[1:-1, 1:-1]
+    ) / dy
+
+    out[1:-1, 1:-1] = np.where(
+        velocity[1:-1, 1:-1] >= 0.0,
+        backward,
+        forward
+    )
+
+    return out
+
+
+def require_finite(*arrays):
+
+    for array in arrays:
+        if not np.all(np.isfinite(array)):
+            raise FloatingPointError(
+                "Non-finite numerical field detected."
+            )
+
+
+# ================================================================
+# 4. INITIALIZE FLOW CONFIGURATIONS
+# ================================================================
+
+def initialize_case(selected_mode, nx, ny, pe):
+
+    if selected_mode in ["forced_plate", "forced_pipe"]:
+        length, height = 5.0, 1.0
+
+    elif selected_mode == "natural_plate":
+        length, height = 1.0, 1.0
+
+    else:
+        raise ValueError("Unknown flow configuration.")
+
+    x1 = np.linspace(0.0, length, nx)
+    y1 = np.linspace(0.0, height, ny)
+
+    x, y = np.meshgrid(x1, y1)
+
+    dx = x1[1] - x1[0]
+    dy = y1[1] - y1[0]
+
+    temperature = np.zeros((ny, nx))
+    marker = np.zeros_like(temperature)
+
+    # ------------------------------------------------------------
+    # CASE 1: FORCED FLAT PLATE
+    # ------------------------------------------------------------
+
+    if selected_mode == "forced_plate":
+
+        delta = (
+            0.035
+            + 0.22 * np.sqrt(
+                np.maximum(x, dx) / length
+            )
+        )
+
+        u = np.tanh(
+            y / np.maximum(delta, 1e-12)
+        )
+
+        v = np.zeros_like(u)
+
+        marker[0, x1 >= 0.25 * length] = 1.0
+
+        name = "forced_flat_plate"
+
+    # ------------------------------------------------------------
+    # CASE 2: FORCED PIPE CHANNEL
+    # ------------------------------------------------------------
+
+    elif selected_mode == "forced_pipe":
+
+        eta = y / height
+
+        u = 6.0 * eta * (1.0 - eta)
+
+        v = np.zeros_like(u)
+
+        marker[0, :] = 1.0
+        marker[-1, :] = 1.0
+
+        name = "forced_pipe_channel"
+
+    # ------------------------------------------------------------
+    # CASE 3: NATURAL CONVECTION SURROGATE
+    # ------------------------------------------------------------
+
+    else:
+
+        amplitude = 1.0 / np.pi
+
+        u = (
+            -amplitude * np.pi / height
+            * np.sin(np.pi * x / length)
+            * np.cos(np.pi * y / height)
+        )
+
+        v = (
+            amplitude * np.pi / length
+            * np.cos(np.pi * x / length)
+            * np.sin(np.pi * y / height)
+        )
+
+        temperature = 1.0 - x / length
+
+        marker[:, 0] = 1.0
+        marker[:, -1] = 2.0
+
+        name = "natural_vertical_plate_surrogate"
+
+    return {
+        "name": name,
+        "x": x,
+        "y": y,
+        "temperature": temperature,
+        "u": u,
+        "v": v,
+        "marker": marker,
+        "Pe": pe,
+        "alpha": 1.0 / pe,
+        "dx": dx,
+        "dy": dy
+    }
+
+
+# ================================================================
+# 5. BOUNDARY CONDITIONS
+# ================================================================
+
+def apply_boundary_conditions(case):
+
+    t = case["temperature"]
+
+    name = case["name"]
+
+    if name == "forced_flat_plate":
+
+        t[:, 0] = 0.0
+        t[-1, :] = 0.0
+
+        heated = (
+            case["x"][0, :]
+            >= 0.25 * case["x"][0, -1]
+        )
+
+        t[0, :] = np.where(
+            heated,
+            1.0,
+            0.0
+        )
+
+        t[1:-1, -1] = t[1:-1, -2]
+
+    elif name == "forced_pipe_channel":
+
+        t[:, 0] = 0.0
+
+        t[0, :] = 1.0
+        t[-1, :] = 1.0
+
+        t[1:-1, -1] = t[1:-1, -2]
+
+    else:
+
+        t[:, 0] = 1.0
+        t[:, -1] = 0.0
+
+        t[0, 1:-1] = t[1, 1:-1]
+        t[-1, 1:-1] = t[-2, 1:-1]
+
+
+# ================================================================
+# 6. QUANTITATIVE MEASUREMENTS
+# ================================================================
+
+def outlet_or_mean_temperature(case):
+
+    t = case["temperature"]
+
+    if case["name"] == "natural_vertical_plate_surrogate":
+        return float(np.mean(t[1:-1, 1:-1]))
+
+    weights = np.maximum(
+        case["u"][1:-1, -1],
+        0.0
+    )
+
+    if float(np.sum(weights)) < 1e-14:
+        return float(np.mean(t[1:-1, -1]))
+
+    return float(
+        np.average(
+            t[1:-1, -1],
+            weights=weights
+        )
+    )
+
+
+def average_wall_flux(case):
+
+    t = case["temperature"]
+
+    if case["name"] == "forced_flat_plate":
+
+        heated = (
+            case["x"][0, 1:-1]
+            >= 0.25 * case["x"][0, -1]
+        )
+
+        flux = -(
+            t[1, 1:-1] - t[0, 1:-1]
+        ) / case["dy"]
+
+        return float(np.mean(flux[heated]))
+
+    elif case["name"] == "forced_pipe_channel":
+
+        bottom = np.abs(
+            (t[0, 1:-1] - t[1, 1:-1])
+            / case["dy"]
+        )
+
+        top = np.abs(
+            (t[-1, 1:-1] - t[-2, 1:-1])
+            / case["dy"]
+        )
+
+        return float(
+            np.mean(np.concatenate((bottom, top)))
+        )
+
+    else:
+
+        flux = -(
+            t[1:-1, 1] - t[1:-1, 0]
+        ) / case["dx"]
+
+        return float(np.mean(flux))
+
+
+# ================================================================
+# 7. VTK FILE WRITER
+# ================================================================
+
+def write_structured_grid_vtk(
+    path, x, y,
+    scalars=None,
+    vectors=None,
+    title="Convection diffusion"
+):
+
+    ny, nx = x.shape
+
+    scalars = scalars or {}
+    vectors = vectors or {}
+
+    with open(path, "w") as f:
+
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write(title + "\n")
+        f.write("ASCII\n")
+        f.write("DATASET STRUCTURED_GRID\n")
+        f.write(f"DIMENSIONS {nx} {ny} 1\n")
+        f.write(f"POINTS {nx * ny} float\n")
+
+        for j in range(ny):
+            for i in range(nx):
+
+                f.write(
+                    f"{x[j,i]:.12e} "
+                    f"{y[j,i]:.12e} 0\n"
+                )
+
+        f.write(f"POINT_DATA {nx * ny}\n")
+
+        for name, values in scalars.items():
+
+            f.write(f"SCALARS {name} float 1\n")
+            f.write("LOOKUP_TABLE default\n")
+
+            for value in values.ravel(order="C"):
+                f.write(f"{value:.12e}\n")
+
+        for name, values in vectors.items():
+
+            f.write(f"VECTORS {name} float\n")
+
+            for vx, vy in zip(
+                values[0].ravel(order="C"),
+                values[1].ravel(order="C")
+            ):
+
+                f.write(
+                    f"{vx:.12e} {vy:.12e} 0\n"
+                )
+
+
+def write_multiline_vtk(path, lines, title="Boundary"):
+
+    points = []
+    connectivity = []
+
+    for x_line, y_line in lines:
+
+        xa = np.asarray(x_line).ravel()
+        ya = np.asarray(y_line).ravel()
+
+        ids = list(
+            range(
+                len(points),
+                len(points) + len(xa)
+            )
+        )
+
+        points.extend(zip(xa.tolist(), ya.tolist()))
+        connectivity.append(ids)
+
+    total = sum(
+        len(ids) + 1
+        for ids in connectivity
+    )
+
+    with open(path, "w") as f:
+
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write(title + "\n")
+        f.write("ASCII\n")
+        f.write("DATASET POLYDATA\n")
+        f.write(f"POINTS {len(points)} float\n")
+
+        for xi, yi in points:
+            f.write(f"{xi:.12e} {yi:.12e} 0\n")
+
+        f.write(
+            f"LINES {len(connectivity)} {total}\n"
+        )
+
+        for ids in connectivity:
+            f.write(
+                f"{len(ids)} "
+                + " ".join(str(i) for i in ids)
+                + "\n"
+            )
+
+
+# ================================================================
+# 8. MAIN CONVECTION-DIFFUSION SOLVER
+# ================================================================
+
+def run_case(case, iterations, output_every, output_dir):
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    apply_boundary_conditions(case)
+
+    u = case["u"]
+    v = case["v"]
+
+    dx = case["dx"]
+    dy = case["dy"]
+    alpha = case["alpha"]
+
+    max_u = max(
+        float(np.max(np.abs(u))),
+        1e-12
+    )
+
+    max_v = max(
+        float(np.max(np.abs(v))),
+        1e-12
+    )
+
+    dt_convective = (
+        0.35 * min(dx / max_u, dy / max_v)
+    )
+
+    dt_diffusive = (
+        0.20 * min(dx**2, dy**2) / alpha
+    )
+
+    dt = min(
+        dt_convective,
+        dt_diffusive
+    )
+
+    history = []
+
+    residual = float("inf")
+
+    print("\n" + "=" * 65)
+    print("CASE:", case["name"])
+    print("Peclet number:", case["Pe"])
+    print("Grid:", case["temperature"].shape)
+    print("Time step:", dt)
+    print("=" * 65)
+
+    # ---------------- TIME LOOP ----------------
+
+    for iteration in range(1, iterations + 1):
+
+        old = case["temperature"].copy()
+
+        convection = (
+            u * upwind_derivative_x(old, u, dx)
+            +
+            v * upwind_derivative_y(old, v, dy)
+        )
+
+        diffusion = laplacian(old, dx, dy)
+
+        updated = old + dt * (
+            -convection
+            + alpha * diffusion
+        )
+
+        case["temperature"][1:-1, 1:-1] = np.clip(
+            updated[1:-1, 1:-1],
+            -0.05,
+            1.05
+        )
+
+        apply_boundary_conditions(case)
+
+        residual = float(
+            np.sqrt(
+                np.mean(
+                    (
+                        case["temperature"][1:-1, 1:-1]
+                        -
+                        old[1:-1, 1:-1]
+                    )**2
+                )
+            )
+        )
+
+        require_finite(case["temperature"])
+
+        if (
+            iteration == 1
+            or iteration == iterations
+            or iteration % output_every == 0
+        ):
+
+            outlet = outlet_or_mean_temperature(case)
+            flux = average_wall_flux(case)
+
+            history.append([
+                iteration,
+                residual,
+                outlet,
+                flux,
+                dt
+            ])
+
+            print(
+                f"Iteration {iteration:5d} | "
+                f"Residual {residual:.6e} | "
+                f"Outlet/mean T {outlet:.6e} | "
+                f"Wall flux {flux:.6e}"
+            )
+
+        if residual < 1e-9 and iteration > 100:
+            print("Convergence tolerance reached.")
+            break
+
+    # ---------------- FINAL FIELDS ----------------
+
+    temperature = case["temperature"]
+
+    speed = np.sqrt(
+        u**2 + v**2
+    )
+
+    local_pe = speed / max(alpha, 1e-30)
+
+    # ---------------- VTK OUTPUT ----------------
+
+    write_structured_grid_vtk(
+        output_dir / f"{case['name']}.vtk",
+        case["x"],
+        case["y"],
+        {
+            "temperature": temperature,
+            "speed": speed,
+            "wall_or_boundary_marker": case["marker"],
+            "local_peclet_speed_based": local_pe
+        },
+        {
+            "velocity": (u, v)
+        },
+        case["name"]
+    )
+
+    length = case["x"][0, -1]
+    height = case["y"][-1, 0]
+
+    if case["name"] in [
+        "forced_flat_plate",
+        "forced_pipe_channel"
+    ]:
+
+        lines = [
+            (
+                np.array([0.0, length]),
+                np.array([0.0, 0.0])
+            ),
+            (
+                np.array([0.0, length]),
+                np.array([height, height])
+            )
+        ]
+
+    else:
+
+        lines = [
+            (
+                np.array([0.0, 0.0]),
+                np.array([0.0, height])
+            ),
+            (
+                np.array([length, length]),
+                np.array([0.0, height])
+            )
+        ]
+
+    write_multiline_vtk(
+        output_dir / f"{case['name']}_boundaries.vtk",
+        lines,
+        f"{case['name']} boundaries"
+    )
+
+    # ---------------- HISTORY CSV ----------------
+
+    with open(
+        output_dir / f"{case['name']}_history.csv",
+        "w",
+        newline=""
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "iteration",
+            "residual_l2",
+            "outlet_or_mean_temperature",
+            "average_wall_flux",
+            "dt"
+        ])
+
+        writer.writerows(history)
+
+    # ---------------- PROFILE CSV ----------------
+
+    ny, nx = temperature.shape
+
+    i_mid = nx // 2
+    j_mid = ny // 2
+
+    with open(
+        output_dir / f"{case['name']}_profiles.csv",
+        "w",
+        newline=""
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "x", "y", "temperature",
+            "u", "v", "speed"
+        ])
+
+        for j in range(ny):
+
+            writer.writerow([
+                case["x"][j, i_mid],
+                case["y"][j, i_mid],
+                temperature[j, i_mid],
+                u[j, i_mid],
+                v[j, i_mid],
+                speed[j, i_mid]
+            ])
+
+        for i in range(nx):
+
+            writer.writerow([
+                case["x"][j_mid, i],
+                case["y"][j_mid, i],
+                temperature[j_mid, i],
+                u[j_mid, i],
+                v[j_mid, i],
+                speed[j_mid, i]
+            ])
+
+    return [
+        case["name"],
+        nx,
+        ny,
+        case["Pe"],
+        dt,
+        residual,
+        outlet_or_mean_temperature(case),
+        average_wall_flux(case)
+    ]
+
+
+# ================================================================
+# 9. RUN ALL THREE FLOW CONFIGURATIONS
+# ================================================================
+
+def run_complete_set(
+    pe, nx, ny,
+    iterations, output_every,
+    output_dir
+):
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    case_modes = [
+        "forced_plate",
+        "forced_pipe",
+        "natural_plate"
+    ]
+
+    rows = []
+
+    for selected_mode in case_modes:
+
+        case = initialize_case(
+            selected_mode,
+            nx,
+            ny,
+            pe
+        )
+
+        row = run_case(
+            case,
+            iterations,
+            output_every,
+            output_dir
+        )
+
+        rows.append(row)
+
+    return rows
+
+
+# ================================================================
+# 10. RUN LAB CASE: Pe = 200
+# ================================================================
+
+LAB_OUT = OUT / "lab_Pe_200"
+
+lab_rows = run_complete_set(
+    200.0,
+    121,
+    61,
+    3000,
+    300,
+    LAB_OUT
+)
+
+
+# ================================================================
+# 11. COMPULSORY PECLET COMPARISON
+# ================================================================
+
+all_summary_rows = []
+
+all_summary_rows.extend(lab_rows)
+
+if RUN_PECLET_COMPARISON:
+
+    for pe_value in [50.0, 1000.0]:
+
+        comparison_dir = (
+            OUT / f"comparison_Pe_{int(pe_value)}"
+        )
+
+        comparison_rows = run_complete_set(
+            pe_value,
+            121,
+            61,
+            3000,
+            300,
+            comparison_dir
+        )
+
+        all_summary_rows.extend(comparison_rows)
+
+
+# ================================================================
+# 12. SAVE COMBINED SUMMARY
+# ================================================================
+
+SUMMARY_FILE = OUT / "convective_transport_summary.csv"
+
+with open(SUMMARY_FILE, "w", newline="") as f:
+
+    writer = csv.writer(f)
+
+    writer.writerow([
+        "case",
+        "nx",
+        "ny",
+        "Pe",
+        "dt",
+        "final_residual",
+        "outlet_or_mean_temperature",
+        "average_wall_flux"
+    ])
+
+    writer.writerows(all_summary_rows)
+
+
+# ================================================================
+# 13. PRINT COMPARISON SUMMARY
+# ================================================================
+
+print("\n" + "=" * 105)
+print("PECLET NUMBER COMPARISON")
+print("=" * 105)
+
+print(
+    f"{'Case':<40}"
+    f"{'Pe':<10}"
+    f"{'Outlet/Mean T':<18}"
+    f"{'Wall Flux':<18}"
+    f"{'Residual':<18}"
+)
+
+for row in all_summary_rows:
+
+    print(
+        f"{row[0]:<40}"
+        f"{row[3]:<10.0f}"
+        f"{row[6]:<18.6e}"
+        f"{row[7]:<18.6e}"
+        f"{row[5]:<18.6e}"
+    )
+
+
+# ================================================================
+# 14. CASE COMPARISON PLOTS
+# ================================================================
+
+summary_by_pe = {}
+
+for row in all_summary_rows:
+
+    summary_by_pe.setdefault(
+        row[3], []
+    ).append(row)
+
+
+for pe_value, rows in sorted(summary_by_pe.items()):
+
+    labels = [
+        row[0].replace("_", "\n")
+        for row in rows
+    ]
+
+    plt.figure(figsize=(8, 4))
+
+    plt.bar(
+        labels,
+        [row[6] for row in rows]
+    )
+
+    plt.ylabel("Outlet or mean temperature")
+    plt.title(
+        f"Case Comparison - Pe = {pe_value:.0f}"
+    )
+
+    plt.grid(True, axis="y")
+    plt.tight_layout()
+
+    plt.savefig(
+        OUT / f"case_comparison_Pe_{int(pe_value)}.png",
+        dpi=200
+    )
+
+    plt.show()
+
+
+# ================================================================
+# 15. TEMPERATURE PROFILE COMPARISON
+# ================================================================
+
+for pe_value, rows in sorted(summary_by_pe.items()):
+
+    folder = (
+        LAB_OUT if pe_value == 200.0
+        else OUT / f"comparison_Pe_{int(pe_value)}"
+    )
+
+    plt.figure(figsize=(8, 5))
+
+    for row in rows:
+
+        profile_path = (
+            folder / f"{row[0]}_profiles.csv"
+        )
+
+        profiles = np.genfromtxt(
+            profile_path,
+            delimiter=",",
+            names=True,
+            dtype=None,
+            encoding="utf-8"
+        )
+
+        profiles = np.atleast_1d(profiles)
+
+        # First ny entries are the vertical midline
+        vertical = profiles[:61]
+
+        plt.plot(
+            vertical["temperature"],
+            vertical["y"],
+            label=row[0].replace("_", " ")
+        )
+
+    plt.xlabel("Temperature")
+    plt.ylabel("Vertical coordinate y")
+    plt.title(
+        f"Temperature Profiles - Pe = {pe_value:.0f}"
+    )
+
+    plt.legend(fontsize=8)
+    plt.grid(True)
+    plt.tight_layout()
+
+    plt.savefig(
+        OUT / f"temperature_profiles_Pe_{int(pe_value)}.png",
+        dpi=200
+    )
+
+    plt.show()
+
+
+# ================================================================
+# 16. RESIDUAL CONVERGENCE PLOTS
+# ================================================================
+
+for pe_value, rows in sorted(summary_by_pe.items()):
+
+    folder = (
+        LAB_OUT if pe_value == 200.0
+        else OUT / f"comparison_Pe_{int(pe_value)}"
+    )
+
+    plt.figure(figsize=(8, 5))
+
+    for row in rows:
+
+        history_path = (
+            folder / f"{row[0]}_history.csv"
+        )
+
+        history = np.genfromtxt(
+            history_path,
+            delimiter=",",
+            names=True,
+            dtype=None,
+            encoding="utf-8"
+        )
+
+        history = np.atleast_1d(history)
+
+        plt.semilogy(
+            history["iteration"],
+            np.maximum(
+                history["residual_l2"],
+                1e-18
+            ),
+            label=row[0].replace("_", " ")
+        )
+
+    plt.xlabel("Iteration")
+    plt.ylabel("Residual L2")
+    plt.title(
+        f"Residual Convergence - Pe = {pe_value:.0f}"
+    )
+
+    plt.legend(fontsize=8)
+    plt.grid(True)
+    plt.tight_layout()
+
+    plt.savefig(
+        OUT / f"residual_convergence_Pe_{int(pe_value)}.png",
+        dpi=200
+    )
+
+    plt.show()
+
+
+# ================================================================
+# 17. WALL FLUX COMPARISON
+# ================================================================
+
+for pe_value, rows in sorted(summary_by_pe.items()):
+
+    labels = [
+        row[0].replace("_", "\n")
+        for row in rows
+    ]
+
+    fluxes = [
+        row[7] for row in rows
+    ]
+
+    plt.figure(figsize=(8, 4))
+
+    plt.bar(
+        labels,
+        fluxes
+    )
+
+    plt.ylabel("Average wall flux")
+    plt.title(
+        f"Wall Flux Comparison - Pe = {pe_value:.0f}"
+    )
+
+    plt.grid(True, axis="y")
+    plt.tight_layout()
+
+    plt.savefig(
+        OUT / f"wall_flux_comparison_Pe_{int(pe_value)}.png",
+        dpi=200
+    )
+
+    plt.show()
+
+
+# ================================================================
+# 18. INLINE VTK TEMPERATURE VISUALIZATION
+# ================================================================
+
+def read_vtk_scalar(path, field_name):
+
+    lines = Path(path).read_text().splitlines()
+
+    dims_index = next(
+        i for i, line in enumerate(lines)
+        if line.startswith("DIMENSIONS ")
+    )
+
+    _, nx, ny, nz = lines[dims_index].split()
+
+    nx = int(nx)
+    ny = int(ny)
+
+    points_index = next(
+        i for i, line in enumerate(lines)
+        if line.startswith("POINTS ")
+    )
+
+    npoints = int(
+        lines[points_index].split()[1]
+    )
+
+    points = np.array([
+        [
+            float(v)
+            for v in lines[points_index + 1 + k].split()[:3]
+        ]
+        for k in range(npoints)
+    ])
+
+    x = points[:, 0].reshape(ny, nx)
+    y = points[:, 1].reshape(ny, nx)
+
+    scalar_index = next(
+        i for i, line in enumerate(lines)
+        if line.startswith(f"SCALARS {field_name} ")
+    )
+
+    start = scalar_index + 2
+
+    values = np.array([
+        float(lines[start + k].split()[0])
+        for k in range(npoints)
+    ])
+
+    return x, y, values.reshape(ny, nx)
+
+
+vtk_path = LAB_OUT / "forced_flat_plate.vtk"
+
+x_field, y_field, temperature_field = read_vtk_scalar(
+    vtk_path,
+    "temperature"
+)
+
+plt.figure(figsize=(9, 4.5))
+
+contour = plt.contourf(
+    x_field,
+    y_field,
+    temperature_field,
+    levels=30,
+    cmap="inferno"
+)
+
+plt.colorbar(
+    contour,
+    label="Temperature"
+)
+
+plt.xlabel("x")
+plt.ylabel("y")
+plt.title(
+    "Forced Flat Plate - Temperature Field (Pe = 200)"
+)
+
+plt.axis("equal")
+plt.tight_layout()
+
+plt.savefig(
+    OUT / "forced_flat_plate_temperature_field.png",
+    dpi=200
+)
+
+plt.show()
+
+
+# ================================================================
+# 19. LIST GENERATED FILES
+# ================================================================
+
+print("\nGENERATED FILES")
+print("-" * 70)
+
+for path in sorted(OUT.rglob("*")):
+
+    if path.is_file():
+
+        size = path.stat().st_size / 1024
+
+        print(
+            f"{path.relative_to(OUT)} "
+            f"({size:.1f} KB)"
+        )
+
+
+# ================================================================
+# 20. ZIP AND DOWNLOAD RESULTS
+# ================================================================
+
+ZIP_PATH = ROOT / "experiment_11_results.zip"
+
+if ZIP_PATH.exists():
+    ZIP_PATH.unlink()
+
+with zipfile.ZipFile(
+    ZIP_PATH,
+    "w",
+    compression=zipfile.ZIP_DEFLATED
+) as archive:
+
+    for path in OUT.rglob("*"):
+
+        if path.is_file():
+
+            archive.write(
+                path,
+                path.relative_to(OUT)
+            )
+
+print("\nResults ZIP created:", ZIP_PATH)
+
+print(
+    f"ZIP size: {ZIP_PATH.stat().st_size / 1024:.1f} KB"
+)
+
+if DOWNLOAD_RESULTS:
+
+    if IN_COLAB:
+        files.download(str(ZIP_PATH))
+    else:
+        print("ZIP saved locally:", ZIP_PATH)
+
+print("\nEXPERIMENT 11 COMPLETED.")
